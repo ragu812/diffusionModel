@@ -99,7 +99,7 @@ impl<B: Backend> SimpleDecoder<B> {
         Self {
             transfer: LinearConfig::new(latent_dimen * 16, 128 * 16 * 16).init(device),
 
-            reverse1: ConvTranspose2dConfig::new([128, 64], [3, 3])
+            reverse1: ConvTranspose2dConfig::new([128, 64], [4, 4])
                 .with_stride([2, 2])
                 .with_padding([1, 1])
                 .with_initializer(Initializer::KaimingUniform {
@@ -109,7 +109,7 @@ impl<B: Backend> SimpleDecoder<B> {
                 .init(device),
             bn_1: BatchNormConfig::new(64).init(device),
 
-            reverse2: ConvTranspose2dConfig::new([64, 32], [3, 3])
+            reverse2: ConvTranspose2dConfig::new([64, 32], [4, 4])
                 .with_stride([2, 2])
                 .with_padding([1, 1])
                 .with_initializer(Initializer::KaimingUniform {
@@ -167,6 +167,7 @@ impl<B: Backend> Vae<B> {
     }
 
     pub fn parametrize(&self, mean: Tensor<B, 2>, variance: Tensor<B, 2>) -> Tensor<B, 4> {
+        let variance = variance.clamp(-10.0, 10.0);
         let std = (variance.clone() * 0.5).exp();
         let noise = Tensor::random_like(&std, burn::tensor::Distribution::Normal(0.0, 1.0));
         let z = mean + noise * std;
@@ -200,10 +201,10 @@ impl<B: Backend> Vae<B> {
         let epsilon = 1e-8;
         let variance = variance + epsilon;
         let kl_loss = -0.5
-            * (Tensor::ones_like(&variance) + variance.clone().log()
+            * (Tensor::ones_like(&variance) + variance.clone()
                 - mean.powf_scalar(2.0)
-                - variance)
-                .sum();
+                - variance.exp())
+            .sum();
         let recon_flat: Tensor<B, 2> = reconstruction.flatten(1, 3);
         let input_flat: Tensor<B, 2> = input.flatten(1, 3);
         let recon_loss = burn::nn::loss::MseLoss::new().forward(
@@ -379,6 +380,7 @@ pub struct Unet<B: Backend> {
 
     mid_res1: ResidualBlock<B>,
     mid_res2: ResidualBlock<B>,
+    mid_atten: Attention<B>,
 
     up1: ConvTranspose2d<B>,
     up_conv1: Conv2d<B>,
@@ -430,6 +432,7 @@ impl<B: Backend> Unet<B> {
 
             mid_res1: ResidualBlock::new(device, 256, time_emb_dim),
             mid_res2: ResidualBlock::new(device, 256, time_emb_dim),
+            mid_atten: Attention::new(256, device),
 
             up1: ConvTranspose2dConfig::new([256, 128], [4, 4])
                 .with_stride([2, 2])
@@ -480,6 +483,7 @@ impl<B: Backend> Unet<B> {
         let down_3 = self.down_res3.forward(down_3, time_embed.clone());
 
         let mut m = self.mid_res1.forward(down_3, time_embed.clone());
+        m = self.mid_atten.forward(m);
         m = self.mid_res2.forward(m, time_embed.clone());
 
         let u1 = self.up1.forward(m);
@@ -668,6 +672,31 @@ impl<B: Backend> DiffusionModel<B> {
             }
         }
         self.vae.decode(z)
+    }
+
+    pub fn train_vae(&self, x: Tensor<B, 4>, kl_weight: f32) -> Tensor<B, 1> {
+        let (reconstruction, mean, variance) = self.vae.forward(x.clone());
+
+        let epsilon = 1e-8;
+        let variance_safe = variance.clone() + epsilon;
+
+        // KL divergence loss
+        let kl_loss: Tensor<B, 1> = -0.5
+            * (Tensor::ones_like(&variance_safe) + variance_safe.clone().log()
+                - mean.powf_scalar(2.0)
+                - variance_safe.exp())
+            .sum();
+
+        let recon_flat: Tensor<B, 2> = reconstruction.flatten(1, 3);
+        let input_flat: Tensor<B, 2> = x.flatten(1, 3);
+        let recon_loss = burn::nn::loss::MseLoss::new().forward(
+            recon_flat,
+            input_flat,
+            burn::nn::loss::Reduction::Mean,
+        );
+
+        let kl_loss_1d: Tensor<B, 1> = kl_loss.mul_scalar(kl_weight).reshape([1]);
+        recon_loss + kl_loss_1d
     }
 }
 
@@ -991,6 +1020,20 @@ pub fn train_ldm_epoch<B: Backend>(
 }
 
 fn main() {
+    use burn::backend::wgpu::WgpuDevice;
+
+    println!("Initializing GPU...");
+    type Backend = Autodiff<Wgpu>;
+    let device = WgpuDevice::default();
+    println!("Using device: {:?}", device);
+
+    let in_channels = 3;
+    let latent_dim = 16;
+    let num_timesteps = 1000;
+    let batch_size = 5;
+    let vae_epochs = 10;
+    let num_epochs = 15;
+
     let augmentation = Augmentation::new()
         .with_horizontal(true)
         .with_vertical(false)
@@ -1008,26 +1051,55 @@ fn main() {
         dataset.size
     );
 
-    use burn::backend::wgpu::WgpuDevice;
-
-    println!("Initializing GPU...");
-    type Backend = Autodiff<Wgpu>;
-    let device = WgpuDevice::default();
-    println!("Using device: {:?}", device);
-
-    let in_channels = 3;
-    let latent_dim = 16;
-    let num_timesteps = 200;
-    let batch_size = 15;
-    let num_epochs = 5;
-
     let mut model = DiffusionModel::<Backend>::new(&device, latent_dim, in_channels, num_timesteps);
     let optimizer_config = AdamConfig::new();
     let mut optimizer = optimizer_config.init();
 
-    let dataset = Image::directory(r"Pictures", 64, 64).unwrap();
-
     println!("Starting training with {} images...", dataset.size);
+
+    println!("Training Vae with losses...");
+
+    for epoch in 0..vae_epochs {
+        let mut total_loss_vae = 0.0f32;
+        let num_batches = dataset.size / batch_size;
+
+        for batch_idx in 0..num_batches {
+            // Prepare batch indices
+            let start_idx = batch_idx * batch_size;
+            let end_idx = (start_idx + batch_size).min(dataset.size);
+            let indices: Vec<usize> = (start_idx..end_idx).collect();
+
+            if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
+                let kl_weight = 0.01 * (1.0 + epoch as f32 / vae_epochs as f32);
+
+                let tensor_loss = model.train_vae(images, kl_weight);
+
+                let grads = tensor_loss.backward();
+                let grad_params = GradientsParams::from_grads(grads, &model);
+                model = optimizer.step(1e-5f64, model, grad_params);
+
+                let loss_val = tensor_loss.into_scalar().elem::<f32>();
+                total_loss_vae += loss_val;
+
+                if batch_idx % 2 == 0 {
+                    println!(
+                        "  Batch {}/{}: Loss = {:.4}",
+                        batch_idx, num_batches, loss_val
+                    );
+                }
+            }
+        }
+
+        let average_loss_vae = total_loss_vae / num_batches as f32;
+        println!(
+            "Epoch in Vae {}: Average Loss = {:.4}",
+            epoch + 1,
+            average_loss_vae
+        );
+    }
+
+    println!("\n The VAE has been trained");
+    save_model(&model, "VAE training.bin").unwrap();
 
     for epoch in 0..num_epochs {
         let mut total_loss = 0.0f32;
@@ -1041,15 +1113,11 @@ fn main() {
             let end_idx = (start_idx + batch_size).min(dataset.size);
             let indices: Vec<usize> = (start_idx..end_idx).collect();
 
-            // Load batch efficiently
             if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
-                // Forward pass - this runs on GPU
                 let loss = model.forward(images, &device);
 
-                // Backward pass - compute gradients on GPU
                 let grads = loss.backward();
 
-                // Extract gradients and update model
                 let grad_params = GradientsParams::from_grads(grads, &model);
                 model = optimizer.step(1e-4f64, model, grad_params);
 
@@ -1067,12 +1135,42 @@ fn main() {
 
         let avg_loss = total_loss / num_batches as f32;
         println!("Epoch {}: Average Loss = {:.4}", epoch + 1, avg_loss);
+
+        if (epoch + 1) % 5 == 0 {
+            save_model(&model, &format!("diffusion_checkpoint{}.bin", epoch + 1)).unwrap();
+
+            println!("Generating Images");
+            let produced = model.sample(1, &device);
+            let produced_img: Tensor<Backend, 3> = produced.squeeze::<3>(0);
+
+            let [channels, height, width] = produced_img.dims();
+
+            let data: Vec<f32> = produced_img.to_data().to_vec().unwrap();
+
+            let img = image::RgbImage::from_fn(width as u32, height as u32, |x, y| {
+                let pixel_idx = (y as usize * width) + x as usize;
+                // Data is in CHW format: all R, then all G, then all B
+                let temp_r: f32 = data[pixel_idx] * 0.5 + 0.5;
+                let clamped_r = temp_r.clamp(0.0, 1.0);
+                let r = (clamped_r * 255.0) as u8;
+                let temp_g: f32 = data[width * height + pixel_idx] * 0.5 + 0.5;
+                let clamped_g = temp_g.clamp(0.0, 1.0);
+                let g = (clamped_g * 255.0) as u8;
+                let temp_b: f32 = data[2 * width * height + pixel_idx] * 0.5 + 0.5;
+                let clamped_b = temp_b.clamp(0.0, 1.0);
+                let b = (clamped_b * 255.0) as u8;
+                image::Rgb([r, g, b])
+            });
+
+            img.save(format!("generated_epoch{}.png", epoch + 1))
+                .unwrap();
+            println!("Saved checkpoint image!");
+        }
     }
 
     save_model(&model, "trained_model.bin").unwrap();
 
     println!("\n=== Generating sample image ===");
-    // Generate and save an image
 
     let generated = model.sample(1, &device);
     let generated_img: Tensor<Backend, 3> = generated.squeeze::<3>(0);
@@ -1083,9 +1181,15 @@ fn main() {
     let img = image::RgbImage::from_fn(width as u32, height as u32, |x, y| {
         let pixel_idx = (y as usize * width) + x as usize;
         // Data is in CHW format: all R, then all G, then all B
-        let r = ((data[pixel_idx] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
-        let g = ((data[width * height + pixel_idx] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
-        let b = ((data[2 * width * height + pixel_idx] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+        let temp_r: f32 = data[pixel_idx] * 0.5 + 0.5;
+        let clamped_r = temp_r.clamp(0.0, 1.0);
+        let r = (clamped_r * 255.0) as u8;
+        let temp_g: f32 = data[width * height + pixel_idx] * 0.5 + 0.5;
+        let clamped_g = temp_g.clamp(0.0, 1.0);
+        let g = (clamped_g * 255.0) as u8;
+        let temp_b: f32 = data[2 * width * height + pixel_idx] * 0.5 + 0.5;
+        let clamped_b = temp_b.clamp(0.0, 1.0);
+        let b = (clamped_b * 255.0) as u8;
         image::Rgb([r, g, b])
     });
     img.save("generated_image3.png").unwrap();

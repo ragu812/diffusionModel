@@ -204,7 +204,7 @@ impl<B: Backend> Vae<B> {
             * (Tensor::ones_like(&variance) + variance.clone()
                 - mean.powf_scalar(2.0)
                 - variance.exp())
-            .sum();
+            .mean();
         let recon_flat: Tensor<B, 2> = reconstruction.flatten(1, 3);
         let input_flat: Tensor<B, 2> = input.flatten(1, 3);
         let recon_loss = burn::nn::loss::MseLoss::new().forward(
@@ -680,12 +680,14 @@ impl<B: Backend> DiffusionModel<B> {
         let epsilon = 1e-8;
         let variance_safe = variance.clone() + epsilon;
 
+        let variance_crt = variance_safe.clamp(-10.0, 10.0);
+
         // KL divergence loss
         let kl_loss: Tensor<B, 1> = -0.5
-            * (Tensor::ones_like(&variance_safe) + variance_safe.clone().log()
+            * (Tensor::ones_like(&variance_crt) + variance_crt.clone()
                 - mean.powf_scalar(2.0)
-                - variance_safe.exp())
-            .sum();
+                - variance_crt.exp())
+            .mean();
 
         let recon_flat: Tensor<B, 2> = reconstruction.flatten(1, 3);
         let input_flat: Tensor<B, 2> = x.flatten(1, 3);
@@ -1028,11 +1030,11 @@ fn main() {
     println!("Using device: {:?}", device);
 
     let in_channels = 3;
-    let latent_dim = 16;
-    let num_timesteps = 1000;
-    let batch_size = 5;
-    let vae_epochs = 10;
-    let num_epochs = 15;
+    let latent_dim = 8;
+    let num_timesteps = 300;
+    let batch_size = 4;
+    let vae_epochs = 15;
+    let num_epochs = 17;
 
     let augmentation = Augmentation::new()
         .with_horizontal(true)

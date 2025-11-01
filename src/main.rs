@@ -727,6 +727,7 @@ pub fn load_model<B: Backend>(
 
     Ok(model)
 }
+
 #[derive(Module, Debug, Clone)]
 pub struct Augmentation {
     pub horizontal_flip: bool,
@@ -1031,10 +1032,10 @@ fn main() {
 
     let in_channels = 3;
     let latent_dim = 8;
-    let num_timesteps = 300;
-    let batch_size = 4;
-    let vae_epochs = 15;
-    let num_epochs = 17;
+    let num_timesteps = 700;
+    let batch_size = 100;
+    let vae_epochs = 400;
+    let num_epochs = 280;
 
     let augmentation = Augmentation::new()
         .with_horizontal(true)
@@ -1063,12 +1064,16 @@ fn main() {
 
     for epoch in 0..vae_epochs {
         let mut total_loss_vae = 0.0f32;
-        let num_batches = dataset.size / batch_size;
+        let num_batches = (dataset.size + batch_size - 1) / batch_size;
 
         for batch_idx in 0..num_batches {
-            // Prepare batch indices
             let start_idx = batch_idx * batch_size;
             let end_idx = (start_idx + batch_size).min(dataset.size);
+
+            if end_idx - start_idx < batch_size {
+                break;
+            }
+
             let indices: Vec<usize> = (start_idx..end_idx).collect();
 
             if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
@@ -1083,7 +1088,7 @@ fn main() {
                 let loss_val = tensor_loss.into_scalar().elem::<f32>();
                 total_loss_vae += loss_val;
 
-                if batch_idx % 2 == 0 {
+                if batch_idx % 10 == 0 {
                     println!(
                         "  Batch {}/{}: Loss = {:.4}",
                         batch_idx, num_batches, loss_val
@@ -1105,15 +1110,18 @@ fn main() {
 
     for epoch in 0..num_epochs {
         let mut total_loss = 0.0f32;
-        let num_batches = dataset.size / batch_size;
+        let num_batches = (dataset.size + batch_size - 1) / batch_size;
 
-        println!("\n=== Epoch {}/{} ===", epoch + 1, num_epochs);
+        println!("\n Epoch {}/{} ", epoch + 1, num_epochs);
 
         for batch_idx in 0..num_batches {
-            // Prepare batch indices
             let start_idx = batch_idx * batch_size;
             let end_idx = (start_idx + batch_size).min(dataset.size);
             let indices: Vec<usize> = (start_idx..end_idx).collect();
+
+            if end_idx - start_idx < batch_size {
+                break;
+            }
 
             if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
                 let loss = model.forward(images, &device);
@@ -1121,12 +1129,12 @@ fn main() {
                 let grads = loss.backward();
 
                 let grad_params = GradientsParams::from_grads(grads, &model);
-                model = optimizer.step(1e-4f64, model, grad_params);
+                model = optimizer.step(5e-5f64, model, grad_params);
 
                 let loss_val = loss.into_scalar().elem::<f32>();
                 total_loss += loss_val;
 
-                if batch_idx % 2 == 0 {
+                if batch_idx % 10 == 0 {
                     println!(
                         "  Batch {}/{}: Loss = {:.4}",
                         batch_idx, num_batches, loss_val
@@ -1138,20 +1146,20 @@ fn main() {
         let avg_loss = total_loss / num_batches as f32;
         println!("Epoch {}: Average Loss = {:.4}", epoch + 1, avg_loss);
 
-        if (epoch + 1) % 5 == 0 {
+        if (epoch + 1) % 2 == 0 {
             save_model(&model, &format!("diffusion_checkpoint{}.bin", epoch + 1)).unwrap();
 
             println!("Generating Images");
             let produced = model.sample(1, &device);
             let produced_img: Tensor<Backend, 3> = produced.squeeze::<3>(0);
 
-            let [channels, height, width] = produced_img.dims();
+            let [_channels, height, width] = produced_img.dims();
 
             let data: Vec<f32> = produced_img.to_data().to_vec().unwrap();
 
             let img = image::RgbImage::from_fn(width as u32, height as u32, |x, y| {
                 let pixel_idx = (y as usize * width) + x as usize;
-                // Data is in CHW format: all R, then all G, then all B
+
                 let temp_r: f32 = data[pixel_idx] * 0.5 + 0.5;
                 let clamped_r = temp_r.clamp(0.0, 1.0);
                 let r = (clamped_r * 255.0) as u8;
@@ -1172,7 +1180,7 @@ fn main() {
 
     save_model(&model, "trained_model.bin").unwrap();
 
-    println!("\n=== Generating sample image ===");
+    println!("\n Generating sample ");
 
     let generated = model.sample(1, &device);
     let generated_img: Tensor<Backend, 3> = generated.squeeze::<3>(0);
@@ -1182,7 +1190,7 @@ fn main() {
 
     let img = image::RgbImage::from_fn(width as u32, height as u32, |x, y| {
         let pixel_idx = (y as usize * width) + x as usize;
-        // Data is in CHW format: all R, then all G, then all B
+
         let temp_r: f32 = data[pixel_idx] * 0.5 + 0.5;
         let clamped_r = temp_r.clamp(0.0, 1.0);
         let r = (clamped_r * 255.0) as u8;

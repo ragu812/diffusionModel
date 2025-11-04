@@ -9,8 +9,14 @@ use burn::tensor::backend::Backend;
 use burn::tensor::ElementConversion;
 use burn::tensor::Int;
 use burn::tensor::Tensor;
+use image::buffer::EnumerateRowsMut;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use std::path::PathBuf;
+
+use egobox_doe::{Lhs, SamplingMethod};
+use egobox_ego::{EgorBuilder, InfillStrategy, InfillOptimizer};
+use egobox_gp::{GpMixture, GpMixtureParams};
+use ndarray::{Array1, Array2, array};
 
 #[derive(Module, Debug)]
 pub struct SimpleEncoder<B: Backend> {
@@ -991,6 +997,7 @@ impl Image {
     }
 }
 
+
 pub fn train_ldm_epoch<B: Backend>(
     model: &DiffusionModel<B>,
     dataset: &Image,
@@ -1022,6 +1029,57 @@ pub fn train_ldm_epoch<B: Backend>(
     total_loss / num_batches as f32
 }
 
+pub struct Hyperparameters{
+    pub learning_rate: f64,
+    pub vae_epochs: usize,
+    pub num_epochs: usize,
+    pub num_steps: usize,
+    pub kl_loss_weight: f32,
+    pub latent_dimen: usize,
+    pub batch_size: usize,
+}
+
+impl Hyperparameters{
+    pub fn new()
+}
+
+pub struct Bayesian{
+    pub n_iter: usize,
+    pub n_points: usize,
+}
+
+impl Bayesian{
+    pub fn new(n_iter: usize, n_points: usize)-> Self{
+        Self{
+            n_iter,
+            n_points
+        }
+    }
+
+    pub fn optimize<F>(&self, objective:F)-> Hyperparameters
+        where F:Fn(&[f64])-> f64{
+            println!("The VAE epochs(range)");
+            println!("The Diffusion epochs(range)");
+            println!("The Learning Rate(range)");
+            println!("The KL Weights(range)");
+            println!("The Batch Size(range)");
+            println!("The Denoising Steps(range)");
+            println!("The Latent Dimension(range)");
+
+            let range = array![[50-200],[50-300],[1e-6,1e-2],[0.001,0.1],[8,32],[50,1500],[4,16]]
+
+            let name = Lhs::new(&range).sample(self.n_points);
+
+            let mut _range = name.clone();
+
+            let mut array:Array2<f64> = Array2::zeros((self.n_points,1));
+            for i in 0..self.n_points{
+               let parameters = range.row(i).to_vec();
+               let hyper_params = Hyperparameters::from_array(&parameters);
+               let loss = objective(&parameters);
+            }
+        }
+}
 fn main() {
     use burn::backend::wgpu::WgpuDevice;
 
@@ -1034,7 +1092,7 @@ fn main() {
     let latent_dim = 8;
     let num_timesteps = 700;
     let batch_size = 100;
-    let vae_epochs = 400;
+    let vae_epochs = 600;
     let num_epochs = 280;
 
     let augmentation = Augmentation::new()

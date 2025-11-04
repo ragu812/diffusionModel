@@ -12,6 +12,7 @@ use burn::tensor::Tensor;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use std::path::PathBuf;
 
+
 #[derive(Module, Debug)]
 pub struct SimpleEncoder<B: Backend> {
     conv1: Conv2d<B>,
@@ -623,7 +624,7 @@ impl<B: Backend> DiffusionModel<B> {
 
     pub fn sample(&self, batch_size: usize, device: &B::Device) -> Tensor<B, 4> {
         let mut z: Tensor<B, 4> = Tensor::random(
-            [batch_size, self.latent_dimen, 4, 4], // Match VAE latent space
+            [batch_size, self.latent_dimen, 4, 4],
             burn::tensor::Distribution::Normal(0.0, 1.0),
             device,
         );
@@ -641,28 +642,40 @@ impl<B: Backend> DiffusionModel<B> {
             let beta_t = beta.clone().slice([i..i + 1]);
 
             let alpha_sqrt = alpha_t.clone().sqrt();
-            let alpha_sqrt_1 = (Tensor::ones_like(&alpha_t) - alpha_t.clone()).sqrt();
+            let alpha_sqrt_1 = (alpha_t.clone() * (-1.0) + 1.0).sqrt();
 
             let [b, c, h, w] = z.dims();
             let alpha_sqrt_exp = alpha_sqrt.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
             let alpha_sqrt_1_exp = alpha_sqrt_1.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
 
+            // Predict clean x0
             let pred_x0 = (z.clone() - noise_pred.clone() * alpha_sqrt_1_exp) / alpha_sqrt_exp;
 
             if i > 0 {
                 let alpha_prev = alpha_1.clone().slice([i - 1..i]);
                 let alpha_prev_sqrt = alpha_prev.clone().sqrt();
-                let alpha_prev_1 = (Tensor::ones_like(&alpha_prev) - alpha_prev).sqrt();
+                let alpha_prev_1 = (alpha_prev.clone() * (-1.0) + 1.0).sqrt();
 
                 let alpha_prev_sqrt_exp =
                     alpha_prev_sqrt.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
                 let alpha_prev_1_exp = alpha_prev_1.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
 
-                z = alpha_prev_sqrt_exp * pred_x0.clone() + alpha_prev_1_exp * noise_pred;
+                // Compute variance: (1 - alpha_prev) / (1 - alpha_t) * beta_t
+                let one_minus_alpha_t = alpha_t.clone() * (-1.0) + 1.0;
+                let one_minus_alpha_prev = alpha_prev.clone() * (-1.0) + 1.0;
 
+                let variance = (one_minus_alpha_prev / one_minus_alpha_t) * beta_t.clone();
+                let sigma_t = variance.sqrt();
+                let sigma_t_exp = sigma_t.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
+
+                // Compute mean using DDPM formula
+                let mean = alpha_prev_sqrt_exp * pred_x0 + alpha_prev_1_exp * noise_pred;
+
+                // Sample fresh noise
                 let noise = Tensor::random_like(&z, burn::tensor::Distribution::Normal(0.0, 1.0));
-                let beta_t_sqrt_exp = beta_t.sqrt().reshape([1, 1, 1, 1]).expand([b, c, h, w]);
-                z = z + beta_t_sqrt_exp * noise;
+
+                // Add noise with correct variance
+                z = mean + sigma_t_exp * noise;
             } else {
                 z = pred_x0;
             }
@@ -671,6 +684,7 @@ impl<B: Backend> DiffusionModel<B> {
                 println!("  Denoising step {}/{}", self.num_time - i, self.num_time);
             }
         }
+
         self.vae.decode(z)
     }
 
@@ -1033,8 +1047,8 @@ fn main() {
     let in_channels = 3;
     let latent_dim = 8;
     let num_timesteps = 700;
-    let batch_size = 100;
-    let vae_epochs = 400;
+    let batch_size = 32;
+    let vae_epochs = 350;
     let num_epochs = 280;
 
     let augmentation = Augmentation::new()

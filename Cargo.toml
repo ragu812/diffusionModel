@@ -9,6 +9,12 @@ burn = { version = "0.18.0", default-features=false, features = ["train","wgpu",
 burn-autodiff = "0.18.0"
 image = "0.25.8"
 rand = "0.9.2"
+ndarray = "0.15"
+egobox-doe = { version = "0.17" }
+egobox-gp  = { version = "0.17" }
+egobox-moe = { version = "0.17" }
+egobox-ego = { version = "0.17" }
+linfa = "0.7"
 
 [profile.release]
    opt-level = 3

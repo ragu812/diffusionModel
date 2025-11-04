@@ -9,10 +9,14 @@ use burn::tensor::backend::Backend;
 use burn::tensor::ElementConversion;
 use burn::tensor::Int;
 use burn::tensor::Tensor;
-use image::buffer::EnumerateRowsMut;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use std::path::PathBuf;
 
+// Add egobox imports for Bayesian Optimization
+use egobox_doe::{Lhs, SamplingMethod};
+use egobox_ego::{EgorBuilder, InfillStrategy, InfillOptimizer};
+use egobox_gp::{GpMixture, GpMixtureParams};
+use ndarray::{Array1, Array2, array};
 
 #[derive(Module, Debug)]
 pub struct SimpleEncoder<B: Backend> {
@@ -84,6 +88,7 @@ impl<B: Backend> SimpleEncoder<B> {
         (mean, variance)
     }
 }
+
 #[derive(Module, Debug)]
 pub struct SimpleDecoder<B: Backend> {
     transfer: Linear<B>,
@@ -154,6 +159,7 @@ impl<B: Backend> SimpleDecoder<B> {
         activation::tanh(y)
     }
 }
+
 #[derive(Module, Debug)]
 pub struct Vae<B: Backend> {
     encoder: SimpleEncoder<B>,
@@ -194,6 +200,12 @@ impl<B: Backend> Vae<B> {
         self.decoder.forward(y)
     }
 
+    pub fn decode_from_mean(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let (mean, _variance) = self.encoder.forward(x);
+        let z = mean.reshape([mean.dims()[0], self.encoder.latent_dimen, 4, 4]);
+        self.decoder.forward(z)
+    }
+
     pub fn vae_loss(
         mean: Tensor<B, 2>,
         variance: Tensor<B, 2>,
@@ -218,7 +230,6 @@ impl<B: Backend> Vae<B> {
     }
 }
 
-//adding attention mechanism to improve the efficiency
 #[derive(Module, Debug)]
 pub struct Attention<B: Backend> {
     question: Linear<B>,
@@ -260,6 +271,7 @@ impl<B: Backend> Attention<B> {
         attn_output + x
     }
 }
+
 #[derive(Module, Debug)]
 pub struct TimeAddition<B: Backend> {
     linear1: Linear<B>,
@@ -318,6 +330,7 @@ pub fn sin_time_addition<B: Backend>(
 
     Tensor::cat(vec![sin_emb, cos_emb], 1)
 }
+
 #[derive(Module, Debug)]
 pub struct ResidualBlock<B: Backend> {
     conv1: Conv2d<B>,
@@ -371,6 +384,7 @@ impl<B: Backend> ResidualBlock<B> {
         activation::silu(h + x)
     }
 }
+
 #[derive(Module, Debug)]
 pub struct Unet<B: Backend> {
     down1: Conv2d<B>,
@@ -401,7 +415,6 @@ impl<B: Backend> Unet<B> {
         Self {
             time_emb: TimeAddition::new(time_emb_dim, device),
 
-            // Downsampling path with stride=2
             down1: Conv2dConfig::new([in_channels, 64], [3, 3])
                 .with_stride([1, 1])
                 .with_padding(PaddingConfig2d::Explicit(1, 1))
@@ -552,6 +565,7 @@ impl<B: Backend> DiffusionModel<B> {
 
         Tensor::from_floats(alpha_bars.as_slice(), device)
     }
+
     pub fn add_noise(
         &self,
         x: Tensor<B, 4>,
@@ -566,7 +580,6 @@ impl<B: Backend> DiffusionModel<B> {
         let height = x.dims()[2];
         let width = x.dims()[3];
 
-        // Gather alpha values for the batch (minimize CPU operations)
         let time_values: Vec<i32> = time.to_data().to_vec().unwrap();
         let alpha_values: Vec<f32> = alpha.to_data().to_vec().unwrap();
 
@@ -585,11 +598,11 @@ impl<B: Backend> DiffusionModel<B> {
         let sqrt_alpha = alpha_t.clone().sqrt();
         let sqrt_one_minus_alpha = (Tensor::ones_like(&alpha_t) - alpha_t).sqrt();
 
-        // All operations stay on GPU
         let noisy = x * sqrt_alpha + noise.clone() * sqrt_one_minus_alpha;
 
         (noisy, noise)
     }
+
     pub fn noise_predict(&self, x_t: Tensor<B, 4>, time_emb: Tensor<B, 2>) -> Tensor<B, 4> {
         self.unet.forward(x_t, time_emb)
     }
@@ -623,69 +636,109 @@ impl<B: Backend> DiffusionModel<B> {
         total_vae_loss + diffusion_loss_1d
     }
 
+    // CORRECTED SAMPLING FUNCTION - Proper DDPM Algorithm
     pub fn sample(&self, batch_size: usize, device: &B::Device) -> Tensor<B, 4> {
+        // Start from pure noise
         let mut z: Tensor<B, 4> = Tensor::random(
             [batch_size, self.latent_dimen, 4, 4],
             burn::tensor::Distribution::Normal(0.0, 1.0),
             device,
         );
 
-        let beta = self.get_betas(device);
-        let alpha_1 = self.get_alphas(device);
+        let betas = self.get_betas(device);
+        let alphas_bar = self.get_alphas(device); // These are cumulative products ᾱ_t
+        let betas_vec: Vec<f32> = betas.to_data().to_vec().unwrap();
+        let alphas_bar_vec: Vec<f32> = alphas_bar.to_data().to_vec().unwrap();
+        
+        // Compute α_t (single step, not cumulative)
+        let alphas_vec: Vec<f32> = betas_vec.iter().map(|&b| 1.0 - b).collect();
 
+        println!("\n🎨 Starting reverse diffusion sampling...");
+        
+        // Reverse diffusion process: from T to 0
         for i in (0..self.num_time).rev() {
             let i_tensor = Tensor::from_ints(vec![i as i32; batch_size].as_slice(), device);
             let i_emb = sin_time_addition(device, i_tensor, 256);
 
+            // Predict noise using U-Net
             let noise_pred = self.noise_predict(z.clone(), i_emb);
 
-            let alpha_t = alpha_1.clone().slice([i..i + 1]);
-            let beta_t = beta.clone().slice([i..i + 1]);
-
-            let alpha_sqrt = alpha_t.clone().sqrt();
-            let alpha_sqrt_1 = (alpha_t.clone() * (-1.0) + 1.0).sqrt();
+            // Get current timestep parameters
+            let alpha_t = alphas_vec[i];
+            let alpha_bar_t = alphas_bar_vec[i];
+            let beta_t = betas_vec[i];
 
             let [b, c, h, w] = z.dims();
-            let alpha_sqrt_exp = alpha_sqrt.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
-            let alpha_sqrt_1_exp = alpha_sqrt_1.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
-
-            // Predict clean x0
-            let pred_x0 = (z.clone() - noise_pred.clone() * alpha_sqrt_1_exp) / alpha_sqrt_exp;
 
             if i > 0 {
-                let alpha_prev = alpha_1.clone().slice([i - 1..i]);
-                let alpha_prev_sqrt = alpha_prev.clone().sqrt();
-                let alpha_prev_1 = (alpha_prev.clone() * (-1.0) + 1.0).sqrt();
-
-                let alpha_prev_sqrt_exp =
-                    alpha_prev_sqrt.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
-                let alpha_prev_1_exp = alpha_prev_1.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
-
-                // Compute variance: (1 - alpha_prev) / (1 - alpha_t) * beta_t
-                let one_minus_alpha_t = alpha_t.clone() * (-1.0) + 1.0;
-                let one_minus_alpha_prev = alpha_prev.clone() * (-1.0) + 1.0;
-
-                let variance = (one_minus_alpha_prev / one_minus_alpha_t) * beta_t.clone();
-                let sigma_t = variance.sqrt();
-                let sigma_t_exp = sigma_t.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
-
-                // Compute mean using DDPM formula
-                let mean = alpha_prev_sqrt_exp * pred_x0 + alpha_prev_1_exp * noise_pred;
-
-                // Sample fresh noise
+                // Standard DDPM update for t > 0
+                let alpha_bar_prev = alphas_bar_vec[i - 1];
+                
+                // Compute posterior variance: β̃_t = (1 - ᾱ_{t-1}) / (1 - ᾱ_t) * β_t
+                let posterior_variance = ((1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)) * beta_t;
+                let posterior_variance_clipped = posterior_variance.max(1e-20);
+                
+                // Predict x_0 from x_t and noise: x̂_0 = (x_t - √(1-ᾱ_t)·ε_θ) / √ᾱ_t
+                let sqrt_alpha_bar_t = alpha_bar_t.sqrt();
+                let sqrt_one_minus_alpha_bar_t = (1.0 - alpha_bar_t).sqrt();
+                
+                let sqrt_alpha_bar_t_tensor = Tensor::from_floats(&[sqrt_alpha_bar_t], device)
+                    .reshape([1, 1, 1, 1])
+                    .expand([b, c, h, w]);
+                let sqrt_one_minus_alpha_bar_t_tensor = Tensor::from_floats(&[sqrt_one_minus_alpha_bar_t], device)
+                    .reshape([1, 1, 1, 1])
+                    .expand([b, c, h, w]);
+                
+                let pred_x0 = (z.clone() - noise_pred.clone() * sqrt_one_minus_alpha_bar_t_tensor) 
+                    / sqrt_alpha_bar_t_tensor;
+                
+                // Compute mean of posterior: μ̃_t = √ᾱ_{t-1}·β_t/(1-ᾱ_t)·x̂_0 + √α_t·(1-ᾱ_{t-1})/(1-ᾱ_t)·x_t
+                let coef1 = (alpha_bar_prev.sqrt() * beta_t) / (1.0 - alpha_bar_t);
+                let coef2 = (alpha_t.sqrt() * (1.0 - alpha_bar_prev)) / (1.0 - alpha_bar_t);
+                
+                let coef1_tensor = Tensor::from_floats(&[coef1], device)
+                    .reshape([1, 1, 1, 1])
+                    .expand([b, c, h, w]);
+                let coef2_tensor = Tensor::from_floats(&[coef2], device)
+                    .reshape([1, 1, 1, 1])
+                    .expand([b, c, h, w]);
+                
+                let mean = pred_x0 * coef1_tensor + z.clone() * coef2_tensor;
+                
+                // Add noise: z_{t-1} = μ̃_t + √β̃_t·ε where ε ~ N(0, I)
                 let noise = Tensor::random_like(&z, burn::tensor::Distribution::Normal(0.0, 1.0));
-
-                // Add noise with correct variance
-                z = mean + sigma_t_exp * noise;
+                let sigma = posterior_variance_clipped.sqrt();
+                let sigma_tensor = Tensor::from_floats(&[sigma], device)
+                    .reshape([1, 1, 1, 1])
+                    .expand([b, c, h, w]);
+                
+                z = mean + sigma_tensor * noise;
+                
             } else {
-                z = pred_x0;
+                // Final step (t=0): just predict x_0 without adding noise
+                let sqrt_alpha_bar_t = alpha_bar_t.sqrt();
+                let sqrt_one_minus_alpha_bar_t = (1.0 - alpha_bar_t).sqrt();
+                
+                let sqrt_alpha_bar_t_tensor = Tensor::from_floats(&[sqrt_alpha_bar_t], device)
+                    .reshape([1, 1, 1, 1])
+                    .expand([b, c, h, w]);
+                let sqrt_one_minus_alpha_bar_t_tensor = Tensor::from_floats(&[sqrt_one_minus_alpha_bar_t], device)
+                    .reshape([1, 1, 1, 1])
+                    .expand([b, c, h, w]);
+                
+                z = (z.clone() - noise_pred * sqrt_one_minus_alpha_bar_t_tensor) 
+                    / sqrt_alpha_bar_t_tensor;
             }
 
-            if i % 25 == 0 {
-                println!("  Denoising step {}/{}", self.num_time - i, self.num_time);
+            // Progress logging
+            if i % 50 == 0 || i == 0 {
+                println!("  Denoising step {}/{} (t={})", self.num_time - i, self.num_time, i);
             }
         }
-
+        
+        println!("✅ Reverse diffusion complete, decoding latent...");
+        
+        // Decode the denoised latent representation
         self.vae.decode(z)
     }
 
@@ -697,7 +750,6 @@ impl<B: Backend> DiffusionModel<B> {
 
         let variance_crt = variance_safe.clamp(-10.0, 10.0);
 
-        // KL divergence loss
         let kl_loss: Tensor<B, 1> = -0.5
             * (Tensor::ones_like(&variance_crt) + variance_crt.clone()
                 - mean.powf_scalar(2.0)
@@ -741,6 +793,32 @@ pub fn load_model<B: Backend>(
         DiffusionModel::new(device, latent_dimen, in_channels, num_time).load_record(record);
 
     Ok(model)
+}
+
+pub fn save_tensor_as_image<B: Backend>(
+    tensor: Tensor<B, 4>,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let img_tensor: Tensor<B, 3> = tensor.squeeze::<3>(0);
+    let [_channels, height, width] = img_tensor.dims();
+    let data: Vec<f32> = img_tensor.to_data().to_vec().unwrap();
+
+    let img = image::RgbImage::from_fn(width as u32, height as u32, |x, y| {
+        let pixel_idx = (y as usize * width) + x as usize;
+        let temp_r: f32 = data[pixel_idx] * 0.5 + 0.5;
+        let clamped_r = temp_r.clamp(0.0, 1.0);
+        let r = (clamped_r * 255.0) as u8;
+        let temp_g: f32 = data[width * height + pixel_idx] * 0.5 + 0.5;
+        let clamped_g = temp_g.clamp(0.0, 1.0);
+        let g = (clamped_g * 255.0) as u8;
+        let temp_b: f32 = data[2 * width * height + pixel_idx] * 0.5 + 0.5;
+        let clamped_b = temp_b.clamp(0.0, 1.0);
+        let b = (clamped_b * 255.0) as u8;
+        image::Rgb([r, g, b])
+    });
+
+    img.save(path)?;
+    Ok(())
 }
 
 #[derive(Module, Debug, Clone)]
@@ -838,7 +916,6 @@ fn adjust_contrast(img: DynamicImage, factor: f32) -> DynamicImage {
     let rgb = img.to_rgb8();
     let (width, height) = rgb.dimensions();
 
-    // Calculate mean pixel value
     let mut sum = 0.0f32;
     for pixel in rgb.pixels() {
         sum += (pixel[0] as f32 + pixel[1] as f32 + pixel[2] as f32) / 3.0;
@@ -959,25 +1036,20 @@ impl Image {
             return Err(format!("Index {} out of bounds (size: {})", idx, self.size).into());
         }
 
-        // Load image as DynamicImage
         let mut img = image::open(&self.image_paths[idx])?;
 
-        // Apply augmentation (if any)
         if let Some(ref aug) = self.augmentation {
             img = aug.apply(img);
         }
 
-        // Resize (still DynamicImage)
         img = img.resize_exact(
             self.width as u32,
             self.height as u32,
             image::imageops::FilterType::Lanczos3,
         );
 
-        // Convert to RGB8 for tensorization
         let img = img.to_rgb8();
 
-        // Convert to CHW tensor
         let mut data = vec![Vec::with_capacity(self.height * self.width); 3];
         for p in img.pixels() {
             data[0].push((p[0] as f32 / 255.0) * 2.0 - 1.0);
@@ -1006,89 +1078,186 @@ impl Image {
     }
 }
 
-
-pub fn train_ldm_epoch<B: Backend>(
-    model: &DiffusionModel<B>,
-    dataset: &Image,
-    device: &B::Device,
-    batch_size: usize,
-    _learning_rate: f64,
-) -> f32 {
-    let mut total_loss = 0.0f32;
-    let num_batches = dataset.size / batch_size;
-
-    for batch_idx in 0..num_batches {
-        let mut batch_images = Vec::new();
-
-        for i in 0..batch_size {
-            let idx = batch_idx * batch_size + i;
-            if let Ok(img) = dataset.get::<B>(idx, device) {
-                batch_images.push(img);
-            }
-        }
-
-        if !batch_images.is_empty() {
-            let images = Tensor::cat(batch_images, 0);
-            let loss = model.forward(images, device);
-
-            total_loss += loss.into_scalar().elem::<f32>();
-        }
-    }
-
-    total_loss / num_batches as f32
-}
-
-pub struct Hyperparameters{
+// Hyperparameters structure
+#[derive(Debug, Clone, Copy)]
+pub struct Hyperparameters {
     pub learning_rate: f64,
-    pub vae_epochs: usize,
-    pub num_epochs: usize,
-    pub num_steps: usize,
-    pub kl_loss_weight: f32,
-    pub latent_dimen: usize,
+    pub kl_weight: f64,
     pub batch_size: usize,
+    pub latent_dim: usize,
+    pub num_timesteps: usize,
+    pub vae_epochs: usize,
+    pub diffusion_epochs: usize,
 }
 
-impl Hyperparameters{
-    pub fn new()
-}
-
-pub struct Bayesian{
-    pub n_iter: usize,
-    pub n_points: usize,
-}
-
-impl Bayesian{
-    pub fn new(n_iter: usize, n_points: usize)-> Self{
-        Self{
-            n_iter,
-            n_points
+impl Hyperparameters {
+    pub fn from_array(arr: &[f64]) -> Self {
+        Self {
+            learning_rate: arr[0],
+            kl_weight: arr[1],
+            batch_size: arr[2].round() as usize,
+            latent_dim: arr[3].round() as usize,
+            num_timesteps: arr[4].round() as usize,
+            vae_epochs: arr[5].round() as usize,
+            diffusion_epochs: arr[6].round() as usize,
         }
     }
 
-    pub fn optimize<F>(&self, objective:F)-> Hyperparameters
-        where F:Fn(&[f64])-> f64{
-            println!("The VAE epochs(range)");
-            println!("The Diffusion epochs(range)");
-            println!("The Learning Rate(range)");
-            println!("The KL Weights(range)");
-            println!("The Batch Size(range)");
-            println!("The Denoising Steps(range)");
-            println!("The Latent Dimension(range)");
-
-            let range = array![[50-200],[50-300],[1e-6,1e-2],[0.001,0.1],[8,32],[50,1500],[4,16]]
-
-            let name = Lhs::new(&range).sample(self.n_points);
-
-            let mut _range = name.clone();
-
-            let mut array:Array2<f64> = Array2::zeros((self.n_points,1));
-            for i in 0..self.n_points{
-               let parameters = range.row(i).to_vec();
-               let hyper_params = Hyperparameters::from_array(&parameters);
-               let loss = objective(&parameters);
-            }
-        }
+    pub fn to_array(&self) -> Vec<f64> {
+        vec![
+            self.learning_rate,
+            self.kl_weight,
+            self.batch_size as f64,
+            self.latent_dim as f64,
+            self.num_timesteps as f64,
+            self.vae_epochs as f64,
+            self.diffusion_epochs as f64,
+        ]
+    }
 }
+
+// Bayesian Optimization Structure
+pub struct BayesianOptimizer {
+    pub n_iter: usize,
+    pub n_initial_points: usize,
+}
+
+impl BayesianOptimizer {
+    pub fn new(n_iter: usize, n_initial_points: usize) -> Self {
+        Self {
+            n_iter,
+            n_initial_points,
+        }
+    }
+
+    // Optimize all hyperparameters
+    pub fn optimize<F>(&self, objective: F) -> Hyperparameters
+    where
+        F: Fn(&[f64]) -> f64,
+    {
+        println!("\n=== Starting Bayesian Optimization ===");
+        println!("Optimizing 7 hyperparameters:");
+        println!("  1. Learning Rate (1e-6 to 1e-3)");
+        println!("  2. KL Weight (0.001 to 0.1)");
+        println!("  3. Batch Size (16 to 128)");
+        println!("  4. Latent Dimension (4 to 16)");
+        println!("  5. Diffusion Timesteps (100 to 1000)");
+        println!("  6. VAE Epochs (50 to 500)");
+        println!("  7. Diffusion Epochs (50 to 300)");
+        
+        // Define search space for all hyperparameters
+        let xlimits = array![
+            [1e-6, 1e-3],      // learning_rate
+            [0.001, 0.1],      // kl_weight
+            [16.0, 128.0],     // batch_size
+            [4.0, 16.0],       // latent_dim
+            [100.0, 1000.0],   // num_timesteps
+            [50.0, 500.0],     // vae_epochs
+            [50.0, 300.0]      // diffusion_epochs
+        ];
+        
+        // Create initial sampling using Latin Hypercube Sampling
+        let doe = Lhs::new(&xlimits).sample(self.n_initial_points);
+        
+        // Evaluate initial points
+        let mut x_data = doe.clone();
+        let mut y_data: Array2<f64> = Array2::zeros((self.n_initial_points, 1));
+        
+        for i in 0..self.n_initial_points {
+            let params = doe.row(i).to_vec();
+            let hyperparams = Hyperparameters::from_array(&params);
+            
+            println!("\n--- Initial Point {}/{} ---", i + 1, self.n_initial_points);
+            println!("  lr={:.6}, kl={:.4}, batch={}, latent={}, timesteps={}, vae_ep={}, diff_ep={}", 
+                     hyperparams.learning_rate,
+                     hyperparams.kl_weight,
+                     hyperparams.batch_size,
+                     hyperparams.latent_dim,
+                     hyperparams.num_timesteps,
+                     hyperparams.vae_epochs,
+                     hyperparams.diffusion_epochs);
+            
+            let loss = objective(&params);
+            y_data[[i, 0]] = loss;
+            println!("  Loss: {:.4}", loss);
+        }
+        
+        // Build and iterate with Gaussian Process
+        for iter in 0..self.n_iter {
+            println!("\n=== BO Iteration {}/{} ===", iter + 1, self.n_iter);
+            
+            // Fit GP model
+            let gp = GpMixture::params()
+                .n_clusters(1)
+                .fit(&x_data, &y_data)
+                .expect("GP fitting failed");
+            
+            // Find next point using Expected Improvement
+            let egor = EgorBuilder::optimize(
+                |x: &Array2<f64>| -> Array2<f64> {
+                    gp.predict(x).expect("Prediction failed")
+                })
+                .configure(|config| {
+                    config
+                        .doe(&x_data)
+                        .infill_strategy(InfillStrategy::EI)
+                        .infill_optimizer(InfillOptimizer::Cobyla)
+                        .max_iters(1)
+                })
+                .xlimits(&xlimits)
+                .run()
+                .expect("Optimization failed");
+            
+            let x_opt = egor.x_opt.row(0).to_vec();
+            let hyperparams = Hyperparameters::from_array(&x_opt);
+            
+            println!("  Next evaluation:");
+            println!("    lr={:.6}, kl={:.4}, batch={}, latent={}, timesteps={}, vae_ep={}, diff_ep={}", 
+                     hyperparams.learning_rate,
+                     hyperparams.kl_weight,
+                     hyperparams.batch_size,
+                     hyperparams.latent_dim,
+                     hyperparams.num_timesteps,
+                     hyperparams.vae_epochs,
+                     hyperparams.diffusion_epochs);
+            
+            let y_opt = objective(&x_opt);
+            println!("    Loss: {:.4}", y_opt);
+            
+            // Add new point to dataset
+            let new_x = Array2::from_shape_vec((1, 7), x_opt).expect("Shape error");
+            let new_y = array![[y_opt]];
+            
+            x_data = ndarray::concatenate![ndarray::Axis(0), x_data, new_x];
+            y_data = ndarray::concatenate![ndarray::Axis(0), y_data, new_y];
+        }
+        
+        // Find best parameters
+        let best_idx = y_data.iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(idx, _)| idx)
+            .unwrap();
+        
+        let best_params: Vec<f64> = (0..7).map(|j| x_data[[best_idx, j]]).collect();
+        let best_hyperparams = Hyperparameters::from_array(&best_params);
+        let best_loss = y_data[[best_idx, 0]];
+        
+        println!("\n=== Optimization Complete ===");
+        println!("Best hyperparameters found:");
+        println!("  Learning Rate: {:.6}", best_hyperparams.learning_rate);
+        println!("  KL Weight: {:.4}", best_hyperparams.kl_weight);
+        println!("  Batch Size: {}", best_hyperparams.batch_size);
+        println!("  Latent Dimension: {}", best_hyperparams.latent_dim);
+        println!("  Diffusion Timesteps: {}", best_hyperparams.num_timesteps);
+        println!("  VAE Epochs: {}", best_hyperparams.vae_epochs);
+        println!("  Diffusion Epochs: {}", best_hyperparams.diffusion_epochs);
+        println!("  Best Loss: {:.4}", best_loss);
+        
+        best_hyperparams
+    }
+}
+
 fn main() {
     use burn::backend::wgpu::WgpuDevice;
 
@@ -1098,11 +1267,6 @@ fn main() {
     println!("Using device: {:?}", device);
 
     let in_channels = 3;
-    let latent_dim = 8;
-    let num_timesteps = 700;
-    let batch_size = 32;
-    let vae_epochs = 350;
-    let num_epochs = 280;
 
     let augmentation = Augmentation::new()
         .with_horizontal(true)
@@ -1111,49 +1275,130 @@ fn main() {
         .with_brightness(0.2)
         .with_contrast(0.2);
 
-    // Load dataset with augmentation
     let dataset = Image::directory(r"Pictures", 64, 64)
         .unwrap()
         .with_augmentation(augmentation);
 
-    println!(
-        "Starting training with {} images (with augmentation)...",
-        dataset.size
-    );
+    println!("Loaded dataset with {} images (with augmentation)", dataset.size);
 
-    let mut model = DiffusionModel::<Backend>::new(&device, latent_dim, in_channels, num_timesteps);
+    // Bayesian Optimization for ALL hyperparameters
+    println!("\n🔍 Starting comprehensive Bayesian Optimization...");
+    let bayesian_opt = BayesianOptimizer::new(15, 8); // 15 iterations, 8 initial points
+    
+    let best_hyperparams = bayesian_opt.optimize(|params| {
+        let hp = Hyperparameters::from_array(params);
+        
+        // Validate constraints
+        if hp.batch_size > dataset.size {
+            return 1e6; // Penalty for invalid batch size
+        }
+        
+        // Quick validation run with reduced epochs
+        let eval_vae_epochs = (hp.vae_epochs / 10).max(2);
+        let eval_batch_size = hp.batch_size.min(32); // Use smaller batches for faster eval
+        
+        let mut temp_model = DiffusionModel::<Backend>::new(
+            &device, hp.latent_dim, in_channels, hp.num_timesteps
+        );
+        let optimizer_config = AdamConfig::new();
+        let mut temp_optimizer = optimizer_config.init();
+        
+        let mut total_loss = 0.0;
+        let mut count = 0;
+        
+        // Evaluate with reduced epochs
+        for epoch in 0..eval_vae_epochs {
+            let num_batches = (dataset.size + eval_batch_size - 1) / eval_batch_size;
+            
+            for batch_idx in 0..num_batches.min(3) { // Use only first 3 batches
+                let start_idx = batch_idx * eval_batch_size;
+                let end_idx = (start_idx + eval_batch_size).min(dataset.size);
+                
+                if end_idx - start_idx < eval_batch_size {
+                    break;
+                }
+                
+                let indices: Vec<usize> = (start_idx..end_idx).collect();
+                
+                if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
+                    let kl_weight = hp.kl_weight as f32 * (1.0 + epoch as f32 / eval_vae_epochs as f32);
+                    let tensor_loss = temp_model.train_vae(images, kl_weight);
+                    let grads = tensor_loss.backward();
+                    let grad_params = GradientsParams::from_grads(grads, &temp_model);
+                    temp_model = temp_optimizer.step(hp.learning_rate, temp_model, grad_params);
+                    
+                    let loss_val = tensor_loss.into_scalar().elem::<f32>();
+                    total_loss += loss_val;
+                    count += 1;
+                }
+            }
+        }
+        
+        if count == 0 {
+            1e6 // Penalty if no training happened
+        } else {
+            (total_loss / count as f32) as f64
+        }
+    });
+
+    println!("\n✅ Using optimized hyperparameters for full training:");
+    println!("  Learning Rate: {:.6}", best_hyperparams.learning_rate);
+    println!("  KL Weight: {:.4}", best_hyperparams.kl_weight);
+    println!("  Batch Size: {}", best_hyperparams.batch_size);
+    println!("  Latent Dimension: {}", best_hyperparams.latent_dim);
+    println!("  Diffusion Timesteps: {}", best_hyperparams.num_timesteps);
+    println!("  VAE Epochs: {}", best_hyperparams.vae_epochs);
+    println!("  Diffusion Epochs: {}", best_hyperparams.diffusion_epochs);
+
+    // Create model with optimized hyperparameters
+    let mut model = DiffusionModel::<Backend>::new(
+        &device,
+        best_hyperparams.latent_dim,
+        in_channels,
+        best_hyperparams.num_timesteps
+    );
     let optimizer_config = AdamConfig::new();
     let mut optimizer = optimizer_config.init();
 
-    println!("Starting training with {} images...", dataset.size);
+    println!("\n📚 Training VAE with optimized parameters...");
 
-    println!("Training Vae with losses...");
-
-    for epoch in 0..vae_epochs {
+    for epoch in 0..best_hyperparams.vae_epochs {
         let mut total_loss_vae = 0.0f32;
-        let num_batches = (dataset.size + batch_size - 1) / batch_size;
+        let num_batches = (dataset.size + best_hyperparams.batch_size - 1) / best_hyperparams.batch_size;
 
         for batch_idx in 0..num_batches {
-            let start_idx = batch_idx * batch_size;
-            let end_idx = (start_idx + batch_size).min(dataset.size);
+            let start_idx = batch_idx * best_hyperparams.batch_size;
+            let end_idx = (start_idx + best_hyperparams.batch_size).min(dataset.size);
 
-            if end_idx - start_idx < batch_size {
+            if end_idx - start_idx < best_hyperparams.batch_size {
                 break;
             }
 
             let indices: Vec<usize> = (start_idx..end_idx).collect();
 
             if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
-                let kl_weight = 0.01 * (1.0 + epoch as f32 / vae_epochs as f32);
+                let kl_weight = best_hyperparams.kl_weight as f32 
+                    * (1.0 + epoch as f32 / best_hyperparams.vae_epochs as f32);
 
-                let tensor_loss = model.train_vae(images, kl_weight);
+                let tensor_loss = model.train_vae(images.clone(), kl_weight);
 
                 let grads = tensor_loss.backward();
                 let grad_params = GradientsParams::from_grads(grads, &model);
-                model = optimizer.step(1e-5f64, model, grad_params);
+                model = optimizer.step(best_hyperparams.learning_rate, model, grad_params);
 
                 let loss_val = tensor_loss.into_scalar().elem::<f32>();
                 total_loss_vae += loss_val;
+
+                // Save VAE output periodically
+                if epoch % 10 == 0 && batch_idx == 0 {
+                    let reconstructed = model.vae.decode_from_mean(images.clone());
+                    if let Ok(_) = save_tensor_as_image(
+                        reconstructed,
+                        &format!("vae_output_epoch{}.png", epoch)
+                    ) {
+                        println!("  💾 Saved VAE output for epoch {}", epoch);
+                    }
+                }
 
                 if batch_idx % 10 == 0 {
                     println!(
@@ -1166,39 +1411,42 @@ fn main() {
 
         let average_loss_vae = total_loss_vae / num_batches as f32;
         println!(
-            "Epoch in Vae {}: Average Loss = {:.4}",
+            "Epoch {}/{}: Average VAE Loss = {:.4}",
             epoch + 1,
+            best_hyperparams.vae_epochs,
             average_loss_vae
         );
     }
 
-    println!("\n The VAE has been trained");
-    save_model(&model, "VAE training.bin").unwrap();
+    println!("\n✅ VAE training complete!");
+    save_model(&model, "VAE_optimized.bin").unwrap();
 
-    for epoch in 0..num_epochs {
+    println!("\n🎨 Training Diffusion Model...");
+
+    for epoch in 0..best_hyperparams.diffusion_epochs {
         let mut total_loss = 0.0f32;
-        let num_batches = (dataset.size + batch_size - 1) / batch_size;
+        let num_batches = (dataset.size + best_hyperparams.batch_size - 1) / best_hyperparams.batch_size;
 
-        println!("\n Epoch {}/{} ", epoch + 1, num_epochs);
+        println!("\nEpoch {}/{}", epoch + 1, best_hyperparams.diffusion_epochs);
 
         for batch_idx in 0..num_batches {
-            let start_idx = batch_idx * batch_size;
-            let end_idx = (start_idx + batch_size).min(dataset.size);
-            let indices: Vec<usize> = (start_idx..end_idx).collect();
-
-            if end_idx - start_idx < batch_size {
+            let start_idx = batch_idx * best_hyperparams.batch_size;
+            let end_idx = (start_idx + best_hyperparams.batch_size).min(dataset.size);
+            
+            if end_idx - start_idx < best_hyperparams.batch_size {
                 break;
             }
+            
+            let indices: Vec<usize> = (start_idx..end_idx).collect();
 
             if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
-                let loss = model.forward(images, &device);
+                let tensor_loss = model.forward(images, &device);
 
-                let grads = loss.backward();
-
+                let grads = tensor_loss.backward();
                 let grad_params = GradientsParams::from_grads(grads, &model);
-                model = optimizer.step(5e-5f64, model, grad_params);
+                model = optimizer.step(best_hyperparams.learning_rate, model, grad_params);
 
-                let loss_val = loss.into_scalar().elem::<f32>();
+                let loss_val = tensor_loss.into_scalar().elem::<f32>();
                 total_loss += loss_val;
 
                 if batch_idx % 10 == 0 {
@@ -1210,65 +1458,53 @@ fn main() {
             }
         }
 
-        let avg_loss = total_loss / num_batches as f32;
-        println!("Epoch {}: Average Loss = {:.4}", epoch + 1, avg_loss);
+        let average_loss = total_loss / num_batches as f32;
+        println!(
+            "Epoch {}/{}: Average Diffusion Loss = {:.4}",
+            epoch + 1,
+            best_hyperparams.diffusion_epochs,
+            average_loss
+        );
 
-        if (epoch + 1) % 2 == 0 {
-            save_model(&model, &format!("diffusion_checkpoint{}.bin", epoch + 1)).unwrap();
-
-            println!("Generating Images");
-            let produced = model.sample(1, &device);
-            let produced_img: Tensor<Backend, 3> = produced.squeeze::<3>(0);
-
-            let [_channels, height, width] = produced_img.dims();
-
-            let data: Vec<f32> = produced_img.to_data().to_vec().unwrap();
-
-            let img = image::RgbImage::from_fn(width as u32, height as u32, |x, y| {
-                let pixel_idx = (y as usize * width) + x as usize;
-
-                let temp_r: f32 = data[pixel_idx] * 0.5 + 0.5;
-                let clamped_r = temp_r.clamp(0.0, 1.0);
-                let r = (clamped_r * 255.0) as u8;
-                let temp_g: f32 = data[width * height + pixel_idx] * 0.5 + 0.5;
-                let clamped_g = temp_g.clamp(0.0, 1.0);
-                let g = (clamped_g * 255.0) as u8;
-                let temp_b: f32 = data[2 * width * height + pixel_idx] * 0.5 + 0.5;
-                let clamped_b = temp_b.clamp(0.0, 1.0);
-                let b = (clamped_b * 255.0) as u8;
-                image::Rgb([r, g, b])
-            });
-
-            img.save(format!("generated_epoch{}.png", epoch + 1))
-                .unwrap();
-            println!("Saved checkpoint image!");
+        // Generate samples periodically
+        if (epoch + 1) % 10 == 0 {
+            println!("\n🖼️  Generating sample images...");
+            let generated = model.sample(4, &device);
+            
+            for i in 0..4 {
+                let single_image = generated.clone().slice([i..i + 1]);
+                if let Ok(_) = save_tensor_as_image(
+                    single_image,
+                    &format!("generated_epoch{}_sample{}.png", epoch + 1, i)
+                ) {
+                    println!("  💾 Saved sample {} for epoch {}", i, epoch + 1);
+                }
+            }
         }
     }
 
-    save_model(&model, "trained_model.bin").unwrap();
+    println!("\n✅ Diffusion model training complete!");
+    save_model(&model, "DiffusionModel_optimized.bin").unwrap();
 
-    println!("\n Generating sample ");
+    // Final generation
+    println!("\n🎉 Generating final samples...");
+    let final_samples = model.sample(8, &device);
+    
+    for i in 0..8 {
+        let single_image = final_samples.clone().slice([i..i + 1]);
+        if let Ok(_) = save_tensor_as_image(
+            single_image,
+            &format!("final_sample_{}.png", i)
+        ) {
+            println!("  💾 Saved final sample {}", i);
+        }
+    }
 
-    let generated = model.sample(1, &device);
-    let generated_img: Tensor<Backend, 3> = generated.squeeze::<3>(0);
-
-    let [_channels, height, width] = generated_img.dims();
-    let data: Vec<f32> = generated_img.to_data().to_vec().unwrap();
-
-    let img = image::RgbImage::from_fn(width as u32, height as u32, |x, y| {
-        let pixel_idx = (y as usize * width) + x as usize;
-
-        let temp_r: f32 = data[pixel_idx] * 0.5 + 0.5;
-        let clamped_r = temp_r.clamp(0.0, 1.0);
-        let r = (clamped_r * 255.0) as u8;
-        let temp_g: f32 = data[width * height + pixel_idx] * 0.5 + 0.5;
-        let clamped_g = temp_g.clamp(0.0, 1.0);
-        let g = (clamped_g * 255.0) as u8;
-        let temp_b: f32 = data[2 * width * height + pixel_idx] * 0.5 + 0.5;
-        let clamped_b = temp_b.clamp(0.0, 1.0);
-        let b = (clamped_b * 255.0) as u8;
-        image::Rgb([r, g, b])
-    });
-    img.save("generated_image3.png").unwrap();
-    println!("Generated image saved to generated_image3.png");
+    println!("\n🎊 Training and generation complete!");
+    println!("📁 Check your directory for:");
+    println!("   - VAE_optimized.bin");
+    println!("   - DiffusionModel_optimized.bin");
+    println!("   - vae_output_epoch*.png");
+    println!("   - generated_epoch*_sample*.png");
+    println!("   - final_sample_*.png");
 }

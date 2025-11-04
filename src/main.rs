@@ -18,7 +18,8 @@ use linfa::Dataset;
 use egobox_doe::{Lhs, SamplingMethod};
 use egobox_ego::{EgorBuilder, InfillOptimizer, InfillStrategy};
 use egobox_moe::GpMixture;
-use ndarray::{array, Array2, ArrayBase, ViewRepr};
+use ndarray::{array, Array2, ArrayView2};
+use std::sync::Arc;
 
 #[derive(Module, Debug)]
 pub struct SimpleEncoder<B: Backend> {
@@ -1149,16 +1150,18 @@ impl Bayesian {
 
             // Fit GP model
             let dataset_1 = Dataset::new(x_data.clone(), y_data.clone());
-            let gp = GpMixture::params()
-                .n_clusters(1)
-                .fit(&dataset_1)
-                .expect("GP fitting failed");
+            let gp = Arc::new(
+                GpMixture::params()
+                    .n_clusters(1)
+                    .fit(&dataset_1)
+                    .expect("GP fitting failed"),
+            );
 
             // Find next point using Expected Improvement
-            let optimizer =
-                EgorBuilder::optimize(|x: &ArrayBase<ViewRepr<&f64>, _>| -> Array2<f64> {
-                    gp.predict(&x.to_owned()).expect("Prediction failed")
-                });
+            let gp_clone = Arc::clone(&gp);
+            let optimizer = EgorBuilder::optimize(move |x: &ArrayView2<f64>| -> Array2<f64> {
+                gp_clone.predict(x).expect("Prediction failed")
+            });
 
             let optimizer = optimizer.configure(|config| {
                 config
@@ -1173,7 +1176,7 @@ impl Bayesian {
                 .run()
                 .expect("Optimization failed");
 
-            let x_opt = egor.x_opt.row(0).to_vec();
+            let x_opt = egor.x_opt.to_vec();
             let hyperparams = Hyperparameters::array(&x_opt);
 
             println!("  Next evaluation:");

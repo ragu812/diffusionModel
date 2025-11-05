@@ -1237,32 +1237,29 @@ pub fn save_tensor_as_image<B: Backend>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let [_batch, channels, height, width] = tensor.dims();
 
-    // Take first image from batch
     let img_tensor = tensor.slice([0..1]);
     let values: Vec<f32> = img_tensor
         .to_data()
         .to_vec()
         .expect("Failed to convert tensor data");
 
-    // Convert from [-1, 1] to [0, 255]
-    let pixels: Vec<u8> = values
-        .iter()
-        .map(|&x| ((x + 1.0) * 127.5).clamp(0.0, 255.0) as u8)
-        .collect();
-
-    // Create RGB image
     let img = ImageBuffer::from_fn(width as u32, height as u32, |x, y| {
-        let idx = y as usize * width as usize + x as usize;
-        let r = pixels[idx * channels];
-        let g = pixels[idx * channels + 1];
-        let b = pixels[idx * channels + 2];
+        let pixel_idx = (y as usize * width + x as usize) as usize;
+
+        let r_idx = pixel_idx;
+        let g_idx = pixel_idx + (height * width);
+        let b_idx = pixel_idx + 2 * (height * width);
+
+        let r = ((values[r_idx] + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
+        let g = ((values[g_idx] + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
+        let b = ((values[b_idx] + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
+
         Rgb([r, g, b])
     });
 
     img.save(path)?;
     Ok(())
 }
-
 fn main() {
     use burn::backend::wgpu::WgpuDevice;
 

@@ -1113,8 +1113,8 @@ impl Bayesian {
             [16.0, 128.0],
             [4.0, 16.0],
             [100.0, 1000.0],
-            [50.0, 500.0],
-            [50.0, 300.0]
+            [50.0, 150.0],
+            [50.0, 200.0]
         ];
 
         // Create initial sampling using Latin Hypercube Sampling
@@ -1285,10 +1285,13 @@ fn main() {
         dataset.size
     );
 
-    let bayesian_opt = Bayesian::new(10, 8);
+    let bayesian_opt = Bayesian::new(5, 4);
 
     let best_hyperparameter = bayesian_opt.optimize(|params: &[f64]| {
         let hp = Hyperparameters::array(params);
+
+        let opt_run_id: u64 = rand::random();
+        let opt_run_id_str = format!("{:x}", opt_run_id);
 
         if hp.batch_size > dataset.size {
             return 1e-6;
@@ -1306,7 +1309,10 @@ fn main() {
         let mut total_loss = 0.0;
         let mut count = 0;
 
+        let mut last_images: Option<Tensor<Backend, 4>> = None;
+
         for epoch in 0..eval_vae_epochs {
+            println!("\n Epochs {}/{}", epoch + 1, eval_vae_epochs);
             let num_batches = (dataset.size + eval_batch_size - 1) / eval_batch_size;
 
             for batch_idx in 0..num_batches {
@@ -1320,6 +1326,9 @@ fn main() {
                 let indices: Vec<usize> = (start_idx..end_idx).collect();
 
                 if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
+                    if batch_idx == 0 {
+                        last_images = Some(images.clone());
+                    }
                     let kl_weight =
                         hp.kl_loss_weight * (1.0 + epoch as f64 / eval_vae_epochs as f64);
 
@@ -1341,13 +1350,55 @@ fn main() {
                     }
                 }
             }
+            let avg_epoch_loss = total_loss / count as f32;
+            println!(
+                "  Eval Epoch {}/{}: Avg Loss = {:.4}",
+                epoch + 1,
+                eval_vae_epochs,
+                avg_epoch_loss
+            );
+
+            let current_epoch = epoch + 1;
+
+            if current_epoch % 5 == 0 || current_epoch == 1 {
+                if let Some(ref images) = last_images {
+                    if count > 0 {
+                        let z = temp_model.vae.encode(images.clone());
+                        let reconstructed = temp_model.vae.decode(z);
+
+                        let filename = format!(
+                            "run{}_e{}_lr{:.0e}_kl{:.3}_bs{}_ld{}_loss{:.4}.png",
+                            opt_run_id_str,
+                            current_epoch,
+                            hp.learning_rate,
+                            hp.kl_loss_weight,
+                            hp.batch_size,
+                            hp.latent_dimen,
+                            avg_epoch_loss
+                        );
+                        if let Ok(_) = save_tensor_as_image(reconstructed, &filename) {
+                            println!("    ✓ Saved reconstruction: {}", filename);
+                        } else {
+                            eprintln!("    ❌ Failed to save image: {}", filename);
+                        }
+                    }
+                }
+            }
         }
 
         if count == 0 {
-            1e-6
-        } else {
-            (total_loss / count as f32) as f64
+            return 1e6;
         }
+
+        let final_loss = (total_loss / count as f32) as f64;
+
+        if final_loss.is_nan() || final_loss.is_infinite() {
+            println!("  ⚠ Invalid final loss: {}", final_loss);
+            return 1e6;
+        }
+
+        println!("  ✓ Final loss: {:.6}", final_loss);
+        final_loss
     });
     // Create model with optimized hyperparameters
 

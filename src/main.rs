@@ -12,12 +12,12 @@ use burn::tensor::Tensor;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use std::path::PathBuf;
 
-use linfa::traits::Fit;
-use linfa::Dataset;
-
 use egobox_doe::{Lhs, SamplingMethod};
 use egobox_ego::{EgorBuilder, InfillOptimizer, InfillStrategy};
 use egobox_moe::GpMixture;
+use egobox_moe::{CorrelationSpec, RegressionSpec};
+use linfa::traits::Fit;
+use linfa::Dataset;
 use ndarray::{array, Array2, ArrayView2};
 use std::sync::Arc;
 
@@ -1168,6 +1168,9 @@ impl Bayesian {
                     .doe(&x_data)
                     .infill_strategy(InfillStrategy::EI)
                     .infill_optimizer(InfillOptimizer::Cobyla)
+                    .regression_spec(egobox_moe::RegressionSpec::CONSTANT)
+                    .correlation_spec(egobox_moe::CorrelationSpec::SQUAREDEXPONENTIAL)
+                    .n_doe(100)
                     .max_iters(1)
             });
 
@@ -1285,7 +1288,7 @@ fn main() {
         dataset.size
     );
 
-    let bayesian_opt = Bayesian::new(5, 4);
+    let bayesian_opt = Bayesian::new(5, 10);
 
     let best_hyperparameter = bayesian_opt.optimize(|params: &[f64]| {
         let hp = Hyperparameters::array(params);
@@ -1293,11 +1296,15 @@ fn main() {
         let opt_run_id: u64 = rand::random();
         let opt_run_id_str = format!("{:x}", opt_run_id);
 
-        if hp.batch_size > dataset.size {
-            return 1e-6;
+        if hp.batch_size > dataset.size || hp.batch_size < 4 {
+            println!(
+                "  ⚠ Invalid batch size: {} (dataset: {})",
+                hp.batch_size, dataset.size
+            );
+            return 100.0;
         }
 
-        let eval_vae_epochs = (hp.vae_epochs / 10).max(2);
+        let eval_vae_epochs = (hp.vae_epochs / 5).max(5);
         let eval_batch_size = hp.batch_size.min(32);
 
         let mut temp_model =
@@ -1336,7 +1343,7 @@ fn main() {
 
                     let grads = tensor_loss.backward();
                     let grad_params = GradientsParams::from_grads(grads, &temp_model);
-                    temp_model = temp_optimizer.step(1e-5, temp_model, grad_params);
+                    temp_model = temp_optimizer.step(hp.learning_rate, temp_model, grad_params);
 
                     let loss_val = tensor_loss.into_scalar().elem::<f32>();
                     total_loss += loss_val;
@@ -1360,7 +1367,7 @@ fn main() {
 
             let current_epoch = epoch + 1;
 
-            if current_epoch % 5 == 0 || current_epoch == 1 {
+            if current_epoch % 2 == 0 || current_epoch == 1 {
                 if let Some(ref images) = last_images {
                     if count > 0 {
                         let z = temp_model.vae.encode(images.clone());
@@ -1387,18 +1394,19 @@ fn main() {
         }
 
         if count == 0 {
-            return 1e6;
+            return 100.0;
         }
 
         let final_loss = (total_loss / count as f32) as f64;
 
         if final_loss.is_nan() || final_loss.is_infinite() {
             println!("  ⚠ Invalid final loss: {}", final_loss);
-            return 1e6;
+            return 100.0;
         }
+        let clamped_loss = final_loss.clamp(0.001, 100.0);
 
-        println!("  ✓ Final loss: {:.6}", final_loss);
-        final_loss
+        println!("  ✓ Final loss: {:.6}", clamped_loss);
+        clamped_loss
     });
     // Create model with optimized hyperparameters
 
@@ -1406,8 +1414,8 @@ fn main() {
     let mut model = DiffusionModel::<Backend>::new(
         &device,
         best_hyperparameter.latent_dimen,
-        best_hyperparameter.num_steps,
         in_channels,
+        best_hyperparameter.num_steps,
     );
     let optimizer_config = AdamConfig::new();
     let mut optimizer = optimizer_config.init();

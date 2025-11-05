@@ -1405,7 +1405,7 @@ fn main() {
         }
         let clamped_loss = final_loss.clamp(0.001, 100.0);
 
-        println!("  ✓ Final loss: {:.6}", clamped_loss);
+        println!("   Final loss: {:.6}", clamped_loss);
         clamped_loss
     });
     // Create model with optimized hyperparameters

@@ -655,23 +655,32 @@ impl<B: Backend> DiffusionModel<B> {
 
             if i > 0 {
                 let alpha_prev = alpha_1.clone().slice([i - 1..i]);
-                let alpha_prev_sqrt = alpha_prev.clone().sqrt();
-                let alpha_prev_1 = (alpha_prev.clone() * (-1.0) + 1.0).sqrt();
-
-                let alpha_prev_sqrt_exp =
-                    alpha_prev_sqrt.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
-                let alpha_prev_1_exp = alpha_prev_1.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
 
                 // Compute variance: (1 - alpha_prev) / (1 - alpha_t) * beta_t
                 let one_minus_alpha_t = alpha_t.clone() * (-1.0) + 1.0;
                 let one_minus_alpha_prev = alpha_prev.clone() * (-1.0) + 1.0;
 
-                let variance = (one_minus_alpha_prev / (one_minus_alpha_t + 1e-8)) * beta_t.clone();
+                let variance = (one_minus_alpha_prev.clone() / (one_minus_alpha_t.clone() + 1e-8))
+                    * beta_t.clone();
                 let sigma_t = variance.sqrt();
                 let sigma_t_exp = sigma_t.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
 
                 // Compute mean using DDPM formula
-                let mean = alpha_prev_sqrt_exp * pred_x0 + alpha_prev_1_exp * noise_pred;
+                let coef1 =
+                    alpha_prev.clone().sqrt() * beta_t.clone() / (one_minus_alpha_t.clone() + 1e-8);
+
+                let one_minus_beta: Tensor<B, 1> = 1.0 - beta_t.clone();
+                let coef2 =
+                    one_minus_beta.sqrt() * one_minus_alpha_prev / (one_minus_alpha_t + 1e-8);
+
+                // --- FIX STARTS HERE ---
+                // Reshape the 1D coefficients to make them broadcast-compatible with the 4D tensors.
+                let coef1_expanded = coef1.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
+                let coef2_expanded = coef2.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
+
+                // Perform the multiplication using the expanded tensors.
+                let mean = pred_x0.clone() * coef1_expanded + z.clone() * coef2_expanded;
+                // --- FIX ENDS HERE ---
 
                 // Sample fresh noise
                 let noise = Tensor::random_like(&z, burn::tensor::Distribution::Normal(0.0, 1.0));
@@ -1095,8 +1104,8 @@ impl Bayesian {
         println!("Optimizing 7 hyperparameters:");
         println!("  1. Learning Rate (1e-6 to 1e-3)");
         println!("  2. KL Weight (0.001 to 0.1)");
-        println!("  3. Batch Size (16 to 128)");
-        println!("  4. Latent Dimension (4 to 16)");
+        println!("  3. Batch Size (16 to 64)");
+        println!("  4. Latent Dimension (16 to 32)");
         println!("  5. Diffusion Timesteps (100 to 1000)");
         println!("  6. VAE Epochs (50 to 500)");
         println!("  7. Diffusion Epochs (50 to 300)");
@@ -1104,8 +1113,8 @@ impl Bayesian {
         let xlimits = array![
             [1e-6, 1e-3],
             [0.001, 0.1],
-            [16.0, 128.0],
-            [4.0, 16.0],
+            [16.0, 64.0],
+            [8.0, 32.0],
             [100.0, 1000.0],
             [50.0, 150.0],
             [50.0, 200.0]
@@ -1229,7 +1238,7 @@ pub fn save_tensor_as_image<B: Backend>(
     tensor: Tensor<B, 4>,
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let [_batch, channels, height, width] = tensor.dims();
+    let [_batch, _channels, height, width] = tensor.dims();
 
     let img_tensor = tensor.slice([0..1]);
     let values: Vec<f32> = img_tensor
@@ -1295,8 +1304,11 @@ fn main() {
             return 100.0;
         }
 
-        let eval_vae_epochs = (hp.vae_epochs / 5).max(5);
+        let eval_vae_epochs = hp.vae_epochs;
         let eval_batch_size = hp.batch_size.min(32);
+
+        let eval_diffusion_epochs = hp.num_epochs;
+        let eval_diffusion_batches = hp.batch_size.min(32);
 
         let mut temp_model =
             DiffusionModel::<Backend>::new(&device, hp.latent_dimen, 3, hp.num_steps);
@@ -1304,8 +1316,8 @@ fn main() {
         let optimizer = AdamConfig::new();
         let mut temp_optimizer = optimizer.init();
 
-        let mut total_loss = 0.0;
-        let mut count = 0;
+        let mut vae_total_loss = 0.0;
+        let mut vae_count = 0;
 
         let mut last_images: Option<Tensor<Backend, 4>> = None;
 
@@ -1338,8 +1350,8 @@ fn main() {
                     let grad_params = GradientsParams::from_grads(grads, &temp_model);
                     temp_model = temp_optimizer.step(hp.learning_rate, temp_model, grad_params);
 
-                    total_loss += loss_val;
-                    count += 1;
+                    vae_total_loss += loss_val;
+                    vae_count += 1;
 
                     if batch_idx % 10 == 0 {
                         println!(
@@ -1349,7 +1361,7 @@ fn main() {
                     }
                 }
             }
-            let avg_epoch_loss = total_loss / count as f32;
+            let avg_epoch_loss = vae_total_loss / vae_count as f32;
             println!(
                 "  Eval Epoch {}/{}: Avg Loss = {:.4}",
                 epoch + 1,
@@ -1361,7 +1373,7 @@ fn main() {
 
             if current_epoch % 2 == 0 || current_epoch == 1 {
                 if let Some(ref images) = last_images {
-                    if count > 0 {
+                    if vae_count > 0 {
                         let z = temp_model.vae.encode(images.clone());
                         let reconstructed = temp_model.vae.decode(z);
 
@@ -1376,29 +1388,117 @@ fn main() {
                             avg_epoch_loss
                         );
                         if let Ok(_) = save_tensor_as_image(reconstructed, &filename) {
-                            println!("    ✓ Saved reconstruction: {}", filename);
+                            println!(" Saved reconstruction: {}", filename);
                         } else {
-                            eprintln!("    ❌ Failed to save image: {}", filename);
+                            eprintln!(" Failed to save image: {}", filename);
                         }
                     }
                 }
             }
         }
 
-        if count == 0 {
+        if vae_count == 0 {
             return 100.0;
         }
 
-        let final_loss = (total_loss / count as f32) as f64;
+        let vae_loss_ = (vae_total_loss / vae_count as f32) as f64;
 
-        if final_loss.is_nan() || final_loss.is_infinite() {
-            println!("  ⚠ Invalid final loss: {}", final_loss);
+        if vae_loss_.is_nan() || vae_loss_.is_infinite() {
+            println!("  ⚠ Invalid final loss: {}", vae_loss_);
             return 100.0;
         }
-        let clamped_loss = final_loss.clamp(0.001, 100.0);
+        let vae_loss = vae_loss_.clamp(0.001, 100.0);
 
-        println!("   Final loss: {:.6}", clamped_loss);
-        clamped_loss
+        println!("   Final loss: {:.6}", vae_loss);
+
+        //Calculating Diffusion Model using Hyperparameters
+        //
+        let mut diffusion_total_loss = 0.0;
+        let mut diffusion_count = 0;
+
+        for epoch in 0..eval_diffusion_epochs {
+            println!("\n Epochs {}/{}", epoch + 1, eval_diffusion_epochs);
+            let num_batches = (dataset.size + eval_diffusion_batches - 1) / eval_diffusion_batches;
+
+            for batch_idx in 0..num_batches {
+                let start_idx = batch_idx * eval_diffusion_batches;
+                let end_idx = (start_idx + eval_diffusion_batches).min(dataset.size);
+
+                if end_idx - start_idx < eval_batch_size {
+                    break;
+                }
+
+                let indices: Vec<usize> = (start_idx..end_idx).collect();
+
+                if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
+                    let tensor_loss = temp_model.forward(images, &device);
+
+                    let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
+
+                    if loss_val.is_nan() || loss_val.is_infinite() {
+                        println!("Skipping batch due to unstability");
+                        continue;
+                    }
+
+                    let grads = tensor_loss.backward();
+                    let grad_params = GradientsParams::from_grads(grads, &temp_model);
+                    let lr = hp.learning_rate * 0.99_f64.powi(epoch as i32);
+                    temp_model = temp_optimizer.step(lr, temp_model, grad_params);
+
+                    diffusion_total_loss += loss_val;
+                    diffusion_count += 1;
+
+                    if batch_idx % 10 == 0 {
+                        println!(
+                            "  Batch {}/{}: Loss = {:.4}",
+                            batch_idx, num_batches, loss_val
+                        );
+                    }
+                }
+            }
+            let avg_epoch_loss_diffusion = diffusion_total_loss / diffusion_count as f32;
+            println!(
+                "  Eval Epoch {}/{}: Avg Loss = {:.4}",
+                epoch + 1,
+                eval_diffusion_epochs,
+                avg_epoch_loss_diffusion
+            );
+
+            if (epoch + 1) % 10 == 0 {
+                println!("\n Generating sample images...");
+                let generated = temp_model.sample(4, &device);
+
+                for i in 0..1 {
+                    let single_image = generated.clone().slice([i..i + 1]);
+                    if let Ok(_) = save_tensor_as_image(
+                        single_image,
+                        &format!("generated_epoch_diffusion {}_sample{}.png", epoch + 1, i),
+                    ) {
+                        println!(" Saved sample {} for epoch_diffusion {}", i, epoch + 1);
+                    }
+                }
+            }
+        }
+
+        if diffusion_count == 0 {
+            return 100.0;
+        }
+
+        let diffusion_loss = (diffusion_total_loss / diffusion_count as f32) as f64;
+
+        if diffusion_loss.is_nan() || diffusion_loss.is_infinite() {
+            println!("  ⚠ Invalid final loss: {}", diffusion_loss);
+            return 100.0;
+        }
+
+        let combined_loss = vae_loss * 0.3 + diffusion_loss * 0.7;
+
+        println!(
+            "   VAE Loss: {:.6}, Diffusion Loss: {:.6}, Combined: {:.6}",
+            vae_loss, diffusion_loss, combined_loss
+        );
+
+        combined_loss.clamp(0.001, 100.0)
     });
     // Create model with optimized hyperparameters
 

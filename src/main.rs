@@ -624,12 +624,13 @@ impl<B: Backend> DiffusionModel<B> {
         diffusion_loss.reshape([1])
     }
 
-    pub fn sample(&self, batch_size: usize, device: &B::Device) -> Tensor<B, 4> {
+    pub fn denoising_process(&self, batch_size: usize, device: &B::Device) -> Tensor<B, 4> {
         let mut z: Tensor<B, 4> = Tensor::random(
             [batch_size, self.latent_dimen, 4, 4],
             burn::tensor::Distribution::Normal(0.0, 1.0),
             device,
         );
+        //Denoising The Added NOises using DDPM denoising formula
 
         let beta = self.get_betas(device);
         let alpha_1 = self.get_alphas(device);
@@ -650,13 +651,11 @@ impl<B: Backend> DiffusionModel<B> {
             let alpha_sqrt_exp = alpha_sqrt.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
             let alpha_sqrt_1_exp = alpha_sqrt_1.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
 
-            // Predict clean x0
             let pred_x0 = (z.clone() - noise_pred.clone() * alpha_sqrt_1_exp) / alpha_sqrt_exp;
 
             if i > 0 {
                 let alpha_prev = alpha_1.clone().slice([i - 1..i]);
 
-                // Compute variance: (1 - alpha_prev) / (1 - alpha_t) * beta_t
                 let one_minus_alpha_t = alpha_t.clone() * (-1.0) + 1.0;
                 let one_minus_alpha_prev = alpha_prev.clone() * (-1.0) + 1.0;
 
@@ -665,7 +664,6 @@ impl<B: Backend> DiffusionModel<B> {
                 let sigma_t = variance.sqrt();
                 let sigma_t_exp = sigma_t.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
 
-                // Compute mean using DDPM formula
                 let coef1 =
                     alpha_prev.clone().sqrt() * beta_t.clone() / (one_minus_alpha_t.clone() + 1e-8);
 
@@ -673,16 +671,11 @@ impl<B: Backend> DiffusionModel<B> {
                 let coef2 =
                     one_minus_beta.sqrt() * one_minus_alpha_prev / (one_minus_alpha_t + 1e-8);
 
-                // --- FIX STARTS HERE ---
-                // Reshape the 1D coefficients to make them broadcast-compatible with the 4D tensors.
                 let coef1_expanded = coef1.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
                 let coef2_expanded = coef2.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
 
-                // Perform the multiplication using the expanded tensors.
                 let mean = pred_x0.clone() * coef1_expanded + z.clone() * coef2_expanded;
-                // --- FIX ENDS HERE ---
 
-                // Sample fresh noise
                 let noise = Tensor::random_like(&z, burn::tensor::Distribution::Normal(0.0, 1.0));
 
                 // Add noise with correct variance
@@ -705,9 +698,8 @@ impl<B: Backend> DiffusionModel<B> {
         let epsilon = 1e-8;
         let variance_safe = variance.clone() + epsilon;
 
-        let variance_crt = variance_safe.clamp(-10.0, 10.0);
+        let variance_crt = variance_safe.clamp(-20.0, 2.0);
 
-        // KL divergence loss
         let kl_loss: Tensor<B, 1> = -0.5
             * (Tensor::ones_like(&variance_crt) + variance_crt.clone()
                 - mean.powf_scalar(2.0)
@@ -766,34 +758,34 @@ impl Augmentation {
     pub fn new() -> Self {
         Self {
             horizontal_flip: true,
-            vertical_flip: false,
+            vertical_flip: true,
             rotation: true,
             brightness: Some(0.2),
             contrast: Some(0.2),
         }
     }
 
-    pub fn with_horizontal(mut self, flipped: bool) -> Self {
+    pub fn horizontal(mut self, flipped: bool) -> Self {
         self.horizontal_flip = flipped;
         self
     }
 
-    pub fn with_vertical(mut self, flipped: bool) -> Self {
+    pub fn vertical(mut self, flipped: bool) -> Self {
         self.vertical_flip = flipped;
         self
     }
 
-    pub fn with_rotation(mut self, flipped: bool) -> Self {
+    pub fn rotation(mut self, flipped: bool) -> Self {
         self.rotation = flipped;
         self
     }
 
-    pub fn with_brightness(mut self, range: f32) -> Self {
+    pub fn brightness(mut self, range: f32) -> Self {
         self.brightness = Some(range);
         self
     }
 
-    pub fn with_contrast(mut self, range: f32) -> Self {
+    pub fn contrast(mut self, range: f32) -> Self {
         self.contrast = Some(range);
         self
     }
@@ -1105,7 +1097,7 @@ impl Bayesian {
         println!("  1. Learning Rate (1e-6 to 1e-3)");
         println!("  2. KL Weight (0.001 to 0.1)");
         println!("  3. Batch Size (16 to 64)");
-        println!("  4. Latent Dimension (16 to 32)");
+        println!("  4. Latent Dimension (8 to 32)");
         println!("  5. Diffusion Timesteps (100 to 1000)");
         println!("  6. VAE Epochs (50 to 500)");
         println!("  7. Diffusion Epochs (50 to 300)");
@@ -1117,11 +1109,11 @@ impl Bayesian {
             [8.0, 32.0],
             [100.0, 1000.0],
             [50.0, 150.0],
-            [50.0, 200.0]
+            [50.0, 300.0]
         ];
 
         // Create initial sampling using Latin Hypercube Sampling
-        let doe = Lhs::new(&xlimits).sample(self.n_initial_points);
+        let doe = Lhs::new(&xlimits).denoising_process(self.n_initial_points);
 
         let mut x_data = doe.clone();
         let mut y_data: Array2<f64> = Array2::zeros((self.n_initial_points, 1));
@@ -1151,7 +1143,6 @@ impl Bayesian {
         for iter in 0..self.n_iter {
             println!("\n BO Iteration {}/{}", iter + 1, self.n_iter);
 
-            // Fit GP model
             let dataset_1 = Dataset::new(x_data.clone(), y_data.clone());
             let gp = Arc::new(
                 GpMixture::params()
@@ -1234,7 +1225,7 @@ impl Bayesian {
     }
 }
 
-pub fn save_tensor_as_image<B: Backend>(
+pub fn save_as_image<B: Backend>(
     tensor: Tensor<B, 4>,
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1298,7 +1289,7 @@ fn main() {
 
         if hp.batch_size > dataset.size || hp.batch_size < 4 {
             println!(
-                "  ⚠ Invalid batch size: {} (dataset: {})",
+                " Invalid batch size: {} (dataset: {})",
                 hp.batch_size, dataset.size
             );
             return 100.0;
@@ -1387,7 +1378,7 @@ fn main() {
                             hp.latent_dimen,
                             avg_epoch_loss
                         );
-                        if let Ok(_) = save_tensor_as_image(reconstructed, &filename) {
+                        if let Ok(_) = save_as_image(reconstructed, &filename) {
                             println!(" Saved reconstruction: {}", filename);
                         } else {
                             eprintln!(" Failed to save image: {}", filename);
@@ -1412,9 +1403,10 @@ fn main() {
         println!("   Final loss: {:.6}", vae_loss);
 
         //Calculating Diffusion Model using Hyperparameters
-        //
         let mut diffusion_total_loss = 0.0;
         let mut diffusion_count = 0;
+
+        println!("\n Diffusion Model Training has started with Hyperparametrs....");
 
         for epoch in 0..eval_diffusion_epochs {
             println!("\n Epochs {}/{}", epoch + 1, eval_diffusion_epochs);
@@ -1466,11 +1458,11 @@ fn main() {
 
             if (epoch + 1) % 10 == 0 {
                 println!("\n Generating sample images...");
-                let generated = temp_model.sample(4, &device);
+                let generated = temp_model.denoising_process(4, &device);
 
                 for i in 0..1 {
                     let single_image = generated.clone().slice([i..i + 1]);
-                    if let Ok(_) = save_tensor_as_image(
+                    if let Ok(_) = save_as_image(
                         single_image,
                         &format!("generated_epoch_diffusion {}_sample{}.png", epoch + 1, i),
                     ) {
@@ -1486,8 +1478,9 @@ fn main() {
 
         let diffusion_loss = (diffusion_total_loss / diffusion_count as f32) as f64;
 
+        //Used if the loss is NaN
         if diffusion_loss.is_nan() || diffusion_loss.is_infinite() {
-            println!("  ⚠ Invalid final loss: {}", diffusion_loss);
+            println!(" Invalid final loss: {}", diffusion_loss);
             return 100.0;
         }
 
@@ -1502,6 +1495,7 @@ fn main() {
     });
     // Create model with optimized hyperparameters
 
+    println!("\n Selected the best Hyperparameters from the choices...");
     let in_channels = 3;
     let mut model = DiffusionModel::<Backend>::new(
         &device,
@@ -1543,18 +1537,17 @@ fn main() {
 
                 total_loss_vae += loss_val;
 
-                if epoch % 10 == 0 && batch_idx == 0 {
+                if epoch % 5 == 0 && batch_idx == 0 {
                     let z = model.vae.encode(images.clone());
                     let reconstructed = model.vae.decode(z);
-                    if let Ok(_) = save_tensor_as_image(
-                        reconstructed,
-                        &format!("vae_output_epoch{}.png", epoch),
-                    ) {
+                    if let Ok(_) =
+                        save_as_image(reconstructed, &format!("vae_output_epoch{}.png", epoch))
+                    {
                         println!(" Saved VAE output for epoch {}", epoch);
                     }
                 }
 
-                if batch_idx % 10 == 0 {
+                if batch_idx % 5 == 0 {
                     println!(
                         "  Batch {}/{}: Loss = {:.4}",
                         batch_idx, num_batches, loss_val
@@ -1572,10 +1565,10 @@ fn main() {
         );
     }
 
-    println!("\n VAE training complete!");
+    println!("\n VAE training complete.....");
     save_model(&model, "VAE_optimized.bin").unwrap();
 
-    println!("\n  Training Diffusion Model...");
+    println!("\n  Training Diffusion Model with Suitable Hyperparameters......");
 
     for epoch in 0..best_hyperparameter.num_epochs {
         let mut total_loss = 0.0f32;
@@ -1611,7 +1604,7 @@ fn main() {
 
                 total_loss += loss_val;
 
-                if batch_idx % 10 == 0 {
+                if batch_idx % 5 == 0 {
                     println!(
                         "  Batch {}/{}: Loss = {:.4}",
                         batch_idx, num_batches, loss_val
@@ -1627,15 +1620,13 @@ fn main() {
             best_hyperparameter.num_epochs,
             average_loss
         );
-
-        // Generate samples periodically
-        if (epoch + 1) % 10 == 0 {
+        if (epoch + 1) % 5 == 0 {
             println!("\n Generating sample images...");
-            let generated = model.sample(4, &device);
+            let generated = model.denoising_process(4, &device);
 
             for i in 0..4 {
                 let single_image = generated.clone().slice([i..i + 1]);
-                if let Ok(_) = save_tensor_as_image(
+                if let Ok(_) = save_as_image(
                     single_image,
                     &format!("generated_epoch{}_sample{}.png", epoch + 1, i),
                 ) {
@@ -1648,22 +1639,18 @@ fn main() {
     println!("\n Diffusion model training complete!");
     save_model(&model, "DiffusionModel_optimized.bin").unwrap();
 
-    // Final generation
     println!("\n Generating final samples.");
-    let final_samples = model.sample(8, &device);
+    let final_samples = model.denoising_process(8, &device);
 
     for i in 0..8 {
         let single_image = final_samples.clone().slice([i..i + 1]);
-        if let Ok(_) = save_tensor_as_image(single_image, &format!("final_sample_{}.png", i)) {
+        if let Ok(_) = save_as_image(single_image, &format!("final_sample_{}.png", i)) {
             println!(" Saved final sample {}", i);
         }
     }
 
-    println!("\n Training and generation complete!");
-    println!("Check your directory for:");
-    println!(" VAE_optimized.bin");
-    println!("DiffusionModel_optimized.bin");
-    println!("  vae_output_epoch*.png");
-    println!(" generated_epoch*_sample*.png");
-    println!(" final_sample_*.png");
+    println!("\n Training and generation complete....");
+    println!(" \n vae output epoch.png");
+    println!("\n generated epoch sample.png");
+    println!("\n final_sample.png");
 }

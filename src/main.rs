@@ -2,6 +2,7 @@ use burn::backend::{Autodiff, Wgpu};
 use burn::module::Module;
 use burn::nn::conv::{Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig};
 use burn::nn::{BatchNorm, BatchNormConfig, Initializer, Linear, LinearConfig, PaddingConfig2d};
+use burn::optim::decay::WeightDecayConfig;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::record::{CompactRecorder, Recorder};
 use burn::tensor::activation;
@@ -15,7 +16,6 @@ use std::path::PathBuf;
 use egobox_doe::{Lhs, SamplingMethod};
 use egobox_ego::{EgorBuilder, InfillOptimizer, InfillStrategy};
 use egobox_moe::GpMixture;
-use egobox_moe::{CorrelationSpec, RegressionSpec};
 use linfa::traits::Fit;
 use linfa::Dataset;
 use ndarray::{array, Array2, ArrayView2};
@@ -176,8 +176,9 @@ impl<B: Backend> Vae<B> {
     }
 
     pub fn parametrize(&self, mean: Tensor<B, 2>, variance: Tensor<B, 2>) -> Tensor<B, 4> {
-        let variance = variance.clamp(-10.0, 10.0);
+        let variance = variance.clamp(-20.0, 2.0);
         let std = (variance.clone() * 0.5).exp();
+        let std = std + 1e-8;
         let noise = Tensor::random_like(&std, burn::tensor::Distribution::Normal(0.0, 1.0));
         let z = mean + noise * std;
 
@@ -534,7 +535,7 @@ impl<B: Backend> DiffusionModel<B> {
 
     pub fn get_betas(&self, device: &B::Device) -> Tensor<B, 1> {
         let beta_start = 0.0001;
-        let beta_end = 0.02;
+        let beta_end = 0.01;
 
         let steps = self.num_time;
         let betas: Vec<f32> = (0..steps)
@@ -602,13 +603,8 @@ impl<B: Backend> DiffusionModel<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 4>, device: &B::Device) -> Tensor<B, 1> {
+        let z = self.vae.encode(x.clone()).detach();
         let batch_size = x.dims()[0];
-        let (mean, variance) = self.vae.encoder.forward(x.clone());
-
-        let z = self.vae.parametrize(mean.clone(), variance.clone());
-
-        let reconstruction = self.vae.decoder.forward(z.clone());
-        let total_vae_loss = Vae::vae_loss(mean, variance, reconstruction, x);
 
         let t_values: Vec<i32> = (0..batch_size)
             .map(|_| (rand::random::<u32>() % self.num_time as u32) as i32)
@@ -625,9 +621,7 @@ impl<B: Backend> DiffusionModel<B> {
         let noise_2d: Tensor<B, 2> = noise.flatten(1, 3);
         let diffusion_loss = (noise_pred_2d - noise_2d).powf_scalar(2.0).mean();
 
-        let diffusion_loss_1d = diffusion_loss.reshape([1]);
-
-        total_vae_loss + diffusion_loss_1d
+        diffusion_loss.reshape([1])
     }
 
     pub fn sample(&self, batch_size: usize, device: &B::Device) -> Tensor<B, 4> {
@@ -672,7 +666,7 @@ impl<B: Backend> DiffusionModel<B> {
                 let one_minus_alpha_t = alpha_t.clone() * (-1.0) + 1.0;
                 let one_minus_alpha_prev = alpha_prev.clone() * (-1.0) + 1.0;
 
-                let variance = (one_minus_alpha_prev / one_minus_alpha_t) * beta_t.clone();
+                let variance = (one_minus_alpha_prev / (one_minus_alpha_t + 1e-8)) * beta_t.clone();
                 let sigma_t = variance.sqrt();
                 let sigma_t_exp = sigma_t.reshape([1, 1, 1, 1]).expand([b, c, h, w]);
 
@@ -1338,11 +1332,12 @@ fn main() {
 
                     let tensor_loss = temp_model.train_vae(images, kl_weight as f32);
 
+                    let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
+
                     let grads = tensor_loss.backward();
                     let grad_params = GradientsParams::from_grads(grads, &temp_model);
                     temp_model = temp_optimizer.step(hp.learning_rate, temp_model, grad_params);
 
-                    let loss_val = tensor_loss.into_scalar().elem::<f32>();
                     total_loss += loss_val;
                     count += 1;
 
@@ -1414,7 +1409,7 @@ fn main() {
         in_channels,
         best_hyperparameter.num_steps,
     );
-    let optimizer_config = AdamConfig::new();
+    let optimizer_config = AdamConfig::new().with_weight_decay(Some(WeightDecayConfig::new(1e-4)));
     let mut optimizer = optimizer_config.init();
 
     println!("\n Training VAE with optimized parameters...");
@@ -1440,11 +1435,12 @@ fn main() {
 
                 let tensor_loss = model.train_vae(images.clone(), kl_weight);
 
+                let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
+
                 let grads = tensor_loss.backward();
                 let grad_params = GradientsParams::from_grads(grads, &model);
                 model = optimizer.step(best_hyperparameter.learning_rate, model, grad_params);
 
-                let loss_val = tensor_loss.into_scalar().elem::<f32>();
                 total_loss_vae += loss_val;
 
                 if epoch % 10 == 0 && batch_idx == 0 {
@@ -1501,11 +1497,18 @@ fn main() {
             if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
                 let tensor_loss = model.forward(images, &device);
 
+                let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
+
+                if loss_val.is_nan() || loss_val.is_infinite() {
+                    println!("Skipping batch due to unstability");
+                    continue;
+                }
+
                 let grads = tensor_loss.backward();
                 let grad_params = GradientsParams::from_grads(grads, &model);
-                model = optimizer.step(best_hyperparameter.learning_rate, model, grad_params);
+                let lr = best_hyperparameter.learning_rate * 0.99_f64.powi(epoch as i32);
+                model = optimizer.step(lr, model, grad_params);
 
-                let loss_val = tensor_loss.into_scalar().elem::<f32>();
                 total_loss += loss_val;
 
                 if batch_idx % 10 == 0 {

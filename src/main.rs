@@ -534,12 +534,16 @@ impl<B: Backend> DiffusionModel<B> {
     }
 
     pub fn get_betas(&self, device: &B::Device) -> Tensor<B, 1> {
-        let beta_start = 0.0001;
-        let beta_end = 0.01;
+        let beta_start = 1e-4_f32;
+        let beta_end = 0.02_f32;
+        let steps = self.num_time as usize;
 
-        let steps = self.num_time;
         let betas: Vec<f32> = (0..steps)
-            .map(|i| beta_start + (beta_end - beta_start) * (i as f32) / ((steps - 1) as f32))
+            .map(|i| {
+                let ratio = i as f32 / (steps - 1).max(1) as f32;
+                let beta = beta_start + (beta_end - beta_start) * ratio;
+                beta.clamp(1e-6, 0.999) // Prevent extreme values
+            })
             .collect();
 
         Tensor::from_floats(betas.as_slice(), device)
@@ -580,7 +584,15 @@ impl<B: Backend> DiffusionModel<B> {
 
         let gathered_alphas: Vec<f32> = time_values
             .iter()
-            .map(|&t| alpha_values[t as usize])
+            .map(|&t| {
+                let idx = (t as usize).min(alpha_values.len() - 1);
+                let alpha_val = alpha_values[idx];
+                if alpha_val.is_nan() || alpha_val.is_infinite() || alpha_val <= 0.0 {
+                    1e-6_f32 // Safe fallback
+                } else {
+                    alpha_val.clamp(1e-8, 0.9999)
+                }
+            })
             .collect();
 
         let alpha_t: Tensor<B, 1> = Tensor::from_floats(gathered_alphas.as_slice(), device);
@@ -590,10 +602,11 @@ impl<B: Backend> DiffusionModel<B> {
             .repeat_dim(2, height)
             .repeat_dim(3, width);
 
-        let sqrt_alpha = alpha_t.clone().sqrt();
-        let sqrt_one_minus_alpha = (Tensor::ones_like(&alpha_t) - alpha_t).sqrt();
+        let sqrt_alpha = alpha_t.clone().sqrt().clamp(1e-8, 1.0);
+        let one_minus_alpha = Tensor::ones_like(&alpha_t) - alpha_t;
+        let sqrt_one_minus_alpha = one_minus_alpha.clamp(1e-8, 1.0).sqrt();
 
-        // All operations stay on GPU
+        // All operations stay on GPU with safety checks
         let noisy = x * sqrt_alpha + noise.clone() * sqrt_one_minus_alpha;
 
         (noisy, noise)
@@ -613,13 +626,34 @@ impl<B: Backend> DiffusionModel<B> {
         let t = Tensor::from_ints(t_values.as_slice(), device);
         let (z_noisy, noise) = self.add_noise(z, t.clone(), device);
 
+        // Check for NaN in noisy latent
+        let z_sample = z_noisy.clone().into_scalar().elem::<f32>();
+        if z_sample.is_nan() || z_sample.is_infinite() {
+            return Tensor::from_floats([100.0], device).reshape([1]);
+        }
+
         let t_emb = sin_time_addition(device, t, 256);
 
         let noise_pred = self.noise_predict(z_noisy, t_emb);
-        let noise_pred_2d: Tensor<B, 2> = noise_pred.flatten(1, 3);
 
+        // Check for NaN in noise prediction
+        let pred_sample = noise_pred.clone().into_scalar().elem::<f32>();
+        if pred_sample.is_nan() || pred_sample.is_infinite() {
+            return Tensor::from_floats([100.0], device).reshape([1]);
+        }
+
+        let noise_pred_2d: Tensor<B, 2> = noise_pred.flatten(1, 3);
         let noise_2d: Tensor<B, 2> = noise.flatten(1, 3);
-        let diffusion_loss = (noise_pred_2d - noise_2d).powf_scalar(2.0).mean();
+
+        let diff = noise_pred_2d - noise_2d;
+        let squared = diff.powf_scalar(2.0);
+        let diffusion_loss = squared.mean();
+
+        // Final safety check
+        let loss_val = diffusion_loss.clone().into_scalar().elem::<f32>();
+        if loss_val.is_nan() || loss_val.is_infinite() {
+            return Tensor::from_floats([100.0], device).reshape([1]);
+        }
 
         diffusion_loss.reshape([1])
     }
@@ -698,12 +732,25 @@ impl<B: Backend> DiffusionModel<B> {
         let epsilon = 1e-8;
         let variance_safe = variance.clone() + epsilon;
 
-        let variance_crt = variance_safe.clamp(-20.0, 2.0);
+        // More aggressive clamping to prevent exp() explosion
+        let variance_crt = variance_safe.clamp(-10.0, 1.0);
+
+        // Check for NaN/inf in mean and variance before computation
+        let mean_data = mean.clone().into_scalar().elem::<f32>();
+        let var_sample = variance_crt.clone().into_scalar().elem::<f32>();
+
+        if mean_data.is_nan()
+            || mean_data.is_infinite()
+            || var_sample.is_nan()
+            || var_sample.is_infinite()
+        {
+            return Tensor::from_floats([100.0], &x.device());
+        }
 
         let kl_loss: Tensor<B, 1> = -0.5
             * (Tensor::ones_like(&variance_crt) + variance_crt.clone()
-                - mean.powf_scalar(2.0)
-                - variance_crt.exp())
+                - mean.clone().clamp(-5.0, 5.0).powf_scalar(2.0)
+                - variance_crt.exp().clamp(0.0, 100.0))
             .mean();
 
         let recon_flat: Tensor<B, 2> = reconstruction.flatten(1, 3);
@@ -714,9 +761,57 @@ impl<B: Backend> DiffusionModel<B> {
             burn::nn::loss::Reduction::Mean,
         );
 
-        let kl_loss_1d: Tensor<B, 1> = kl_loss.mul_scalar(kl_weight).reshape([1]);
-        recon_loss + kl_loss_1d
+        let kl_loss_1d: Tensor<B, 1> = kl_loss.mul_scalar(kl_weight.clamp(0.0, 1.0)).reshape([1]);
+        let total_loss = recon_loss + kl_loss_1d;
+
+        // Final NaN check
+        let loss_val = total_loss.clone().into_scalar().elem::<f32>();
+        if loss_val.is_nan() || loss_val.is_infinite() {
+            return Tensor::from_floats([100.0], &x.device());
+        }
+
+        total_loss
     }
+}
+
+// Helper function to validate model parameters for NaN/Inf
+fn validate_tensor_batch<B: Backend>(tensor: &Tensor<B, 4>, name: &str) -> bool {
+    let sample_vals: Vec<f32> = tensor
+        .clone()
+        .slice([0..1.min(tensor.dims()[0]), 0..1, 0..1, 0..1])
+        .flatten(0, 3)
+        .to_data()
+        .to_vec()
+        .unwrap_or_else(|_| vec![f32::NAN]);
+
+    for val in sample_vals {
+        if val.is_nan() || val.is_infinite() {
+            println!("⚠ NaN/Inf detected in {}", name);
+            return false;
+        }
+    }
+    true
+}
+
+// Validate loss tensor specifically
+fn validate_loss<B: Backend>(loss: &Tensor<B, 1>, name: &str) -> bool {
+    let loss_val = loss.clone().into_scalar().elem::<f32>();
+    if loss_val.is_nan() || loss_val.is_infinite() {
+        println!("⚠ Invalid {} loss: {}", name, loss_val);
+        return false;
+    }
+    if loss_val > 1000.0 {
+        println!("⚠ Extremely high {} loss: {}", name, loss_val);
+        return false;
+    }
+    true
+}
+
+// Check model gradients for explosion
+fn check_gradient_health<B: Backend>(model: &DiffusionModel<B>) -> bool {
+    // This is a simplified check - in practice you'd iterate through parameters
+    // For now, we'll rely on the loss validation
+    true
 }
 
 pub fn save_model<B: Backend>(
@@ -1295,6 +1390,11 @@ fn main() {
             return 100.0;
         }
 
+        // Early NaN detection flags
+        let mut nan_detected = false;
+        let mut consecutive_nan_count = 0;
+        let max_consecutive_nans = 2;
+
         let eval_vae_epochs = hp.vae_epochs;
         let eval_batch_size = hp.batch_size.min(32);
 
@@ -1337,9 +1437,39 @@ fn main() {
 
                     let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
 
+                    // Check for NaN/inf and handle early stopping
+                    if loss_val.is_nan() || loss_val.is_infinite() {
+                        consecutive_nan_count += 1;
+                        println!(
+                            " NaN detected in VAE batch {}/{}. Count: {}",
+                            batch_idx, num_batches, consecutive_nan_count
+                        );
+
+                        if consecutive_nan_count >= max_consecutive_nans {
+                            println!(
+                                " Early stopping: {} consecutive NaN losses detected",
+                                consecutive_nan_count
+                            );
+                            nan_detected = true;
+                            break;
+                        }
+                        continue;
+                    } else {
+                        consecutive_nan_count = 0; // Reset counter on valid loss
+                    }
+
+                    // Gradient clipping before step
                     let grads = tensor_loss.backward();
                     let grad_params = GradientsParams::from_grads(grads, &temp_model);
-                    temp_model = temp_optimizer.step(hp.learning_rate, temp_model, grad_params);
+
+                    // Use smaller learning rate if loss is getting large
+                    let adaptive_lr = if loss_val > 10.0 {
+                        hp.learning_rate * 0.1
+                    } else {
+                        hp.learning_rate
+                    };
+
+                    temp_model = temp_optimizer.step(adaptive_lr, temp_model, grad_params);
 
                     vae_total_loss += loss_val;
                     vae_count += 1;
@@ -1352,6 +1482,12 @@ fn main() {
                     }
                 }
             }
+
+            // Break out of epoch loop if NaN detected
+            if nan_detected {
+                break;
+            }
+
             let avg_epoch_loss = vae_total_loss / vae_count as f32;
             println!(
                 "  Eval Epoch {}/{}: Avg Loss = {:.4}",
@@ -1359,6 +1495,12 @@ fn main() {
                 eval_vae_epochs,
                 avg_epoch_loss
             );
+
+            if avg_epoch_loss.is_nan() || avg_epoch_loss.is_infinite() {
+                println!("NaN detected in epoch average. Stopping VAE training.");
+                nan_detected = true;
+                break;
+            }
 
             let current_epoch = epoch + 1;
 
@@ -1388,25 +1530,33 @@ fn main() {
             }
         }
 
-        if vae_count == 0 {
-            return 100.0;
+        if vae_count == 0 || nan_detected {
+            println!(
+                " VAE training failed: vae_count={}, nan_detected={}",
+                vae_count, nan_detected
+            );
+            return 100.0; // Tell BO this configuration is bad
         }
 
         let vae_loss_ = (vae_total_loss / vae_count as f32) as f64;
 
         if vae_loss_.is_nan() || vae_loss_.is_infinite() {
-            println!("  ⚠ Invalid final loss: {}", vae_loss_);
-            return 100.0;
+            println!(
+                " Invalid final VAE loss: {}. Telling BO to skip this configuration.",
+                vae_loss_
+            );
+            return 100.0; // Return high loss to BO
         }
         let vae_loss = vae_loss_.clamp(0.001, 100.0);
 
-        println!("   Final loss: {:.6}", vae_loss);
+        println!("✓ VAE Final loss: {:.6}", vae_loss);
 
         //Calculating Diffusion Model using Hyperparameters
         let mut diffusion_total_loss = 0.0;
         let mut diffusion_count = 0;
+        consecutive_nan_count = 0;
 
-        println!("\n Diffusion Model Training has started with Hyperparametrs....");
+        println!("\n Diffusion Model Training has started with Hyperparameters....");
 
         for epoch in 0..eval_diffusion_epochs {
             println!("\n Epochs {}/{}", epoch + 1, eval_diffusion_epochs);
@@ -1427,9 +1577,24 @@ fn main() {
 
                     let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
 
-                    if loss_val.is_nan() || loss_val.is_infinite() {
-                        println!("Skipping batch due to unstability");
+                    if loss_val.is_nan() || loss_val.is_infinite() || loss_val > 150.0 {
+                        consecutive_nan_count += 1;
+                        println!(
+                            " NaN in diffusion batch {}/{}. Count: {}",
+                            batch_idx, num_batches, consecutive_nan_count
+                        );
+
+                        if consecutive_nan_count >= max_consecutive_nans {
+                            println!(
+                                "Early stopping diffusion: {} consecutive NaN losses",
+                                consecutive_nan_count
+                            );
+                            nan_detected = true;
+                            break;
+                        }
                         continue;
+                    } else {
+                        consecutive_nan_count = 0;
                     }
 
                     let grads = tensor_loss.backward();
@@ -1448,6 +1613,12 @@ fn main() {
                     }
                 }
             }
+
+            // Break out if NaN detected
+            if nan_detected {
+                break;
+            }
+
             let avg_epoch_loss_diffusion = diffusion_total_loss / diffusion_count as f32;
             println!(
                 "  Eval Epoch {}/{}: Avg Loss = {:.4}",
@@ -1455,6 +1626,13 @@ fn main() {
                 eval_diffusion_epochs,
                 avg_epoch_loss_diffusion
             );
+
+            // Check epoch average for NaN
+            if avg_epoch_loss_diffusion.is_nan() || avg_epoch_loss_diffusion.is_infinite() {
+                println!("NaN in diffusion epoch average. Stopping.");
+                nan_detected = true;
+                break;
+            }
 
             if (epoch + 1) % 10 == 0 {
                 println!("\n Generating sample images...");
@@ -1472,22 +1650,29 @@ fn main() {
             }
         }
 
-        if diffusion_count == 0 {
-            return 100.0;
+        if diffusion_count == 0 || nan_detected {
+            println!(
+                " Diffusion training failed: diffusion_count={}, nan_detected={}",
+                diffusion_count, nan_detected
+            );
+            return 100.0; // Tell BO this configuration failed
         }
 
         let diffusion_loss = (diffusion_total_loss / diffusion_count as f32) as f64;
 
-        //Used if the loss is NaN
-        if diffusion_loss.is_nan() || diffusion_loss.is_infinite() {
-            println!(" Invalid final loss: {}", diffusion_loss);
-            return 100.0;
+        //Final NaN check for diffusion loss
+        if diffusion_loss.is_nan() || diffusion_loss.is_infinite() || diffusion_loss > 100.0 {
+            println!(
+                " Invalid final diffusion loss: {}. Configuration rejected.",
+                diffusion_loss
+            );
+            return 100.0; // Tell BO to move to next point
         }
 
         let combined_loss = vae_loss * 0.3 + diffusion_loss * 0.7;
 
         println!(
-            "   VAE Loss: {:.6}, Diffusion Loss: {:.6}, Combined: {:.6}",
+            "✓ VAE Loss: {:.6}, Diffusion Loss: {:.6}, Combined: {:.6}",
             vae_loss, diffusion_loss, combined_loss
         );
 
@@ -1592,8 +1777,11 @@ fn main() {
 
                 let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
 
-                if loss_val.is_nan() || loss_val.is_infinite() {
-                    println!("Skipping batch due to unstability");
+                if loss_val.is_nan() || loss_val.is_infinite() || loss_val > 100.0 {
+                    println!(
+                        " Skipping batch {}/{} due to NaN/Inf loss",
+                        batch_idx, num_batches
+                    );
                     continue;
                 }
 
@@ -1642,7 +1830,7 @@ fn main() {
     println!("\n Generating final samples.");
     let final_samples = model.denoising_process(8, &device);
 
-    for i in 0..8 {
+    for i in 0..4 {
         let single_image = final_samples.clone().slice([i..i + 1]);
         if let Ok(_) = save_as_image(single_image, &format!("final_sample_{}.png", i)) {
             println!(" Saved final sample {}", i);

@@ -1540,7 +1540,7 @@ fn main() {
 
         let vae_loss_ = (vae_total_loss / vae_count as f32) as f64;
 
-        if vae_loss_.is_nan() || vae_loss_.is_infinite() {
+        if vae_loss_.is_nan() || vae_loss_.is_infinite() || vae_loss > 150.0{
             println!(
                 " Invalid final VAE loss: {}. Telling BO to skip this configuration.",
                 vae_loss_
@@ -1650,14 +1650,6 @@ fn main() {
             }
         }
 
-        if diffusion_count == 0 || nan_detected {
-            println!(
-                " Diffusion training failed: diffusion_count={}, nan_detected={}",
-                diffusion_count, nan_detected
-            );
-            return 100.0; // Tell BO this configuration failed
-        }
-
         let diffusion_loss = (diffusion_total_loss / diffusion_count as f32) as f64;
 
         //Final NaN check for diffusion loss
@@ -1666,7 +1658,8 @@ fn main() {
                 " Invalid final diffusion loss: {}. Configuration rejected.",
                 diffusion_loss
             );
-            return 100.0; // Tell BO to move to next point
+            nan_detected = true;
+            break;
         }
 
         let combined_loss = vae_loss * 0.3 + diffusion_loss * 0.7;
@@ -1716,6 +1709,16 @@ fn main() {
 
                 let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
 
+                // Check for NaN/Inf and terminate immediately
+                if loss_val.is_nan() || loss_val.is_infinite() || loss_val > 150.0 {
+                    println!(
+                        "NaN/Inf detected in final VAE training batch {}/{}. Terminating training.",
+                        batch_idx, num_batches
+                    );
+                    println!("Proceeding with current model state to diffusion training.");
+                    break;
+                }
+
                 let grads = tensor_loss.backward();
                 let grad_params = GradientsParams::from_grads(grads, &model);
                 model = optimizer.step(best_hyperparameter.learning_rate, model, grad_params);
@@ -1742,6 +1745,14 @@ fn main() {
         }
 
         let average_loss_vae = total_loss_vae / num_batches as f32;
+
+        // Check for NaN in epoch average
+        if average_loss_vae.is_nan() || average_loss_vae.is_infinite() || average_loss_vae > 150.0 {
+            println!("NaN/Inf detected in VAE epoch average. Terminating VAE training.");
+            println!("Proceeding with current model state to diffusion training.");
+            break;
+        }
+
         println!(
             "Epoch {}/{}: Average VAE Loss = {:.4}",
             epoch + 1,
@@ -1779,10 +1790,11 @@ fn main() {
 
                 if loss_val.is_nan() || loss_val.is_infinite() || loss_val > 100.0 {
                     println!(
-                        " Skipping batch {}/{} due to NaN/Inf loss",
+                        "NaN/Inf detected in final diffusion training batch {}/{}. Terminating training.",
                         batch_idx, num_batches
                     );
-                    continue;
+                    println!("Training complete with current model state.");
+                    break;
                 }
 
                 let grads = tensor_loss.backward();
@@ -1802,6 +1814,16 @@ fn main() {
         }
 
         let average_loss = total_loss / num_batches as f32;
+
+        // Check for NaN in epoch average
+        if average_loss.is_nan() || average_loss.is_infinite() || average_loss > 150.0 {
+            println!(
+                "NaN/Inf detected in diffusion epoch average. Terminating diffusion training."
+            );
+            println!("Training complete with current model state.");
+            break;
+        }
+
         println!(
             "Epoch {}/{}: Average Diffusion Loss = {:.4}",
             epoch + 1,
@@ -1827,14 +1849,13 @@ fn main() {
     println!("\n Diffusion model training complete!");
     save_model(&model, "DiffusionModel_optimized.bin").unwrap();
 
-    println!("\n Generating final samples.");
-    let final_samples = model.denoising_process(8, &device);
+    println!("\n Generating final sample.");
+    let final_sample = model.denoising_process(1, &device);
 
-    for i in 0..4 {
-        let single_image = final_samples.clone().slice([i..i + 1]);
-        if let Ok(_) = save_as_image(single_image, &format!("final_sample_{}.png", i)) {
-            println!(" Saved final sample {}", i);
-        }
+    if let Ok(_) = save_as_image(final_sample, "final_sample.png") {
+        println!(" Saved final sample: final_sample.png");
+    } else {
+        println!(" Failed to save final sample");
     }
 
     println!("\n Training and generation complete....");

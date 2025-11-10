@@ -1057,8 +1057,34 @@ impl Image {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Hyperparameters {
+    pub learning_rate: f64,
+    pub kl_loss_weight: f64,
+    pub batch_size: usize,
+    pub latent_dimen: usize,
+    pub num_steps: usize,
+    pub vae_epochs: usize,
+    pub num_epochs: usize,
+}
+
+impl Hyperparameters {
+    pub fn array(params: &[f64]) -> Self {
+        Self {
+            learning_rate: params[0],
+            kl_loss_weight: params[1],
+            batch_size: params[2] as usize,
+            latent_dimen: params[3] as usize,
+            num_steps: params[4] as usize,
+            vae_epochs: params[5] as usize,
+            num_epochs: params[6] as usize,
+        }
+    }
+}
+
 pub struct Bayesian{
-    py_optimizer: Py<PyAny>
+    py_optimizer: Py<PyAny>,
+    n_iterations: usize,
 }
 
 impl Bayesian{
@@ -1068,16 +1094,17 @@ impl Bayesian{
 
             let sys = py.import("sys")?;
             let path = sys.getattr("path")?;
-            path.call_method1("append",(".",))?;
+            path.call_method1("append",("bayesian",))?;
 
-            let bo_module = py.import("bayesian")?;
-            let bo_class = bo_module.getattr("Bayesian")?;
+            let bo_module = py.import("main")?;
+            let bo_class = bo_module.getattr("BayesianLDM")?;
             let py_bounds = PyList::new(py, &bounds);
 
-            let py_optimizer = bo_class.call1((py_bounds,n_iterations))?;
+            let py_optimizer = bo_class.call1((py_bounds, n_iterations))?;
 
             Ok(Self{
-                py_optimizer:py_optimizer.into(),
+                py_optimizer: py_optimizer.into(),
+                n_iterations,
             })
         })
     }
@@ -1109,6 +1136,19 @@ impl Bayesian{
 
             Ok((best_params, best_score))
         })
+    }
+
+    fn optimize<F>(&self, mut f: F) -> PyResult<Hyperparameters>
+    where
+        F: FnMut(&[f64]) -> f64,
+    {
+        for _ in 0..self.n_iterations {
+            let params = self.suggest()?;
+            let score = f(&params);
+            self.observe(params, score)?;
+        }
+        let (best_params, _) = self.get_best()?;
+        Ok(Hyperparameters::array(&best_params))
     }
 }
 
@@ -1198,7 +1238,16 @@ fn main() {
         dataset.size
     );
 
-    let bayesian_opt = Bayesian::new(5, 10);
+    let bounds = vec![
+        (0.0001, 0.1),
+        (0.001, 0.1),
+        (16.0, 64.0),
+        (12.0, 64.0),
+        (150.0, 1200.0),
+        (30.0, 150.0),
+        (50.0, 200.0),
+    ];
+    let bayesian_opt = Bayesian::new(bounds, 10).unwrap();
 
     let best_hyperparameter = bayesian_opt.optimize(|params: &[f64]| {
         let hp = Hyperparameters::array(params);

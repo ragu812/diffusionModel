@@ -9,35 +9,25 @@ from sklearn.gaussian_process.kernels import Matern
 
 class BayesianLDM:
     def __init__(self, bounds: List[Tuple[float, float]], n_iterations: int):
-        bound = [
-            (0.0001, 0.1),
-            (0.001, 0.1),
-            (16, 64),
-            (12, 64),
-            (150, 1200),
-            (30, 150),
-            (50, 200),
-        ]
-        n_iteration = 10
-
         print("Printing BO within the bounds")
 
-        self.bounds = np.array(bound)
+        self.bounds = np.array(bounds)
         self.n_params = len(bounds)
-        self.n_iterations = n_iteration
+        self.n_iterations = n_iterations
 
         self.x_observed = []
         self.y_observed = []
 
-        self.gp = GaussianProcessRegressor(kernal=Matern(nu=2.5), normalize_y=True)
+        self.gp = GaussianProcessRegressor(kernel=Matern(nu=2.5), normalize_y=True)
 
         self.best_params = None
         self.best_score = -np.inf
 
     def suggest(self) -> List[float]:
-        if len(self.x_observed) < 10:
-            params = np.random.uniform(self.bounds[0, :0], self.bounds[0, :1])
-            print("\n The suggested points from BO {params.tolist()}")
+        if len(self.x_observed) < 2:
+            params = np.random.uniform(self.bounds[:, 0], self.bounds[:, 1])
+            print(f"\n The suggested points from BO {params.tolist()}")
+            return params.tolist()
 
         x = np.array(self.x_observed)
         y = np.array(self.y_observed)
@@ -48,7 +38,7 @@ class BayesianLDM:
         return next_params.tolist()
 
     def observe(self, params: List[float], score: float):
-        print("The best Parameters = {params}, and Score = float")
+        print(f"The observed Parameters = {params}, and Score = {score}")
 
         self.x_observed.append(np.array(params))
         self.y_observed.append(score)
@@ -56,7 +46,7 @@ class BayesianLDM:
         if score > self.best_score:
             self.best_score = score
             self.best_params = np.array(params)
-            print("The new best score = {Score}")
+            print(f"The new best score = {score}")
 
     def get_best(self) -> Tuple[List[float], float]:
         if self.best_params is None:

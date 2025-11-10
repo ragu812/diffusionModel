@@ -1094,9 +1094,12 @@ impl Bayesian {
             let path = sys.getattr("path")?;
             path.call_method1("append", ("bayesian",))?;
 
-            let bo_module = py.import("main")?;
+            let bo_module = py.import("bayesian")?;
             let bo_class = bo_module.getattr("BayesianLDM")?;
-            let py_bounds = PyList::new(py, &bounds);
+            let py_bounds = PyList::empty(py);
+            for bound in &bounds {
+                py_bounds.append(bound.into_py(py))?;
+            }
 
             let py_optimizer = bo_class.call((py_bounds, n_iterations), None)?;
 
@@ -1118,7 +1121,10 @@ impl Bayesian {
     fn observe(&self, params: Vec<f64>, score: f64) -> PyResult<()> {
         Python::with_gil(|py| {
             let optimizer = self.py_optimizer.as_ref(py);
-            let py_params = PyList::new(py, &params);
+            let py_params = PyList::empty(py);
+            for param in &params {
+                py_params.append((*param).into_py(py))?;
+            }
             optimizer.call_method("observe", (py_params, score), None)?;
             Ok(())
         })

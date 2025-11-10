@@ -1531,8 +1531,7 @@ fn main() {
                 " Invalid final diffusion loss: {}. Configuration rejected.",
                 diffusion_loss
             );
-            nan_detected = true;
-            break;
+            return 100.0;
         }
 
         let combined_loss = vae_loss * 0.3 + diffusion_loss * 0.7;
@@ -1542,8 +1541,8 @@ fn main() {
             vae_loss, diffusion_loss, combined_loss
         );
 
-        combined_loss.clamp(0.001, 100.0)
-    });
+        -combined_loss.clamp(0.001, 100.0)
+    }).unwrap();
     // Create model with optimized hyperparameters
 
     println!("\n Selected the best Hyperparameters from the choices...");

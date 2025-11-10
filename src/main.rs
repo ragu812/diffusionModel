@@ -647,7 +647,7 @@ impl<B: Backend> DiffusionModel<B> {
         // Final safety check
         let loss_val = diffusion_loss.clone().into_scalar().elem::<f32>();
         if loss_val.is_nan() || loss_val.is_infinite() {
-            return Tensor<B,1>::from_floats([100.0], device).reshape([1]);
+            return Tensor::from_floats([100.0], device).reshape([1]);
         }
 
         diffusion_loss.reshape([1])
@@ -1082,27 +1082,25 @@ impl Hyperparameters {
     }
 }
 
-pub struct Bayesian{
+pub struct Bayesian {
     py_optimizer: Py<PyAny>,
     n_iterations: usize,
 }
 
-impl Bayesian{
-
-    fn new(bounds: Vec<(f64,f64)>, n_iterations: usize) -> PyResult<Self>{
-        Python::with_gil(|py|{
-
+impl Bayesian {
+    fn new(bounds: Vec<(f64, f64)>, n_iterations: usize) -> PyResult<Self> {
+        Python::with_gil(|py| {
             let sys = py.import("sys")?;
             let path = sys.getattr("path")?;
-            path.call_method1("append",("bayesian",))?;
+            path.call_method1("append", ("bayesian",))?;
 
             let bo_module = py.import("main")?;
             let bo_class = bo_module.getattr("BayesianLDM")?;
             let py_bounds = PyList::new(py, &bounds);
 
-            let py_optimizer = bo_class.call1((py_bounds, n_iterations))?;
+            let py_optimizer = bo_class.call((py_bounds, n_iterations), None)?;
 
-            Ok(Self{
+            Ok(Self {
                 py_optimizer: py_optimizer.into(),
                 n_iterations,
             })
@@ -1121,7 +1119,7 @@ impl Bayesian{
         Python::with_gil(|py| {
             let optimizer = self.py_optimizer.as_ref(py);
             let py_params = PyList::new(py, &params);
-            optimizer.call_method1("observe", (py_params, score))?;
+            optimizer.call_method("observe", (py_params, score), None)?;
             Ok(())
         })
     }
@@ -1182,7 +1180,6 @@ pub fn train_ldm_epoch<B: Backend>(
 
     total_loss / num_batches as f32
 }
-
 
 pub fn save_as_image<B: Backend>(
     tensor: Tensor<B, 4>,
@@ -1249,300 +1246,303 @@ fn main() {
     ];
     let bayesian_opt = Bayesian::new(bounds, 10).unwrap();
 
-    let best_hyperparameter = bayesian_opt.optimize(|params: &[f64]| {
-        let hp = Hyperparameters::array(params);
+    let best_hyperparameter = bayesian_opt
+        .optimize(|params: &[f64]| {
+            let hp = Hyperparameters::array(params);
 
-        let opt_run_id: u64 = rand::random();
-        let opt_run_id_str = format!("{:x}", opt_run_id);
+            let opt_run_id: u64 = rand::random();
+            let opt_run_id_str = format!("{:x}", opt_run_id);
 
-        if hp.batch_size > dataset.size || hp.batch_size < 4 {
-            println!(
-                " Invalid batch size: {} (dataset: {})",
-                hp.batch_size, dataset.size
-            );
-            return 100.0;
-        }
+            if hp.batch_size > dataset.size || hp.batch_size < 4 {
+                println!(
+                    " Invalid batch size: {} (dataset: {})",
+                    hp.batch_size, dataset.size
+                );
+                return 100.0;
+            }
 
-        // Early NaN detection flags
-        let mut nan_detected = false;
-        let mut consecutive_nan_count = 0;
-        let max_consecutive_nans = 2;
+            // Early NaN detection flags
+            let mut nan_detected = false;
+            let mut consecutive_nan_count = 0;
+            let max_consecutive_nans = 2;
 
-        let eval_vae_epochs = hp.vae_epochs;
-        let eval_batch_size = hp.batch_size.min(32);
+            let eval_vae_epochs = hp.vae_epochs;
+            let eval_batch_size = hp.batch_size.min(32);
 
-        let eval_diffusion_epochs = hp.num_epochs;
-        let eval_diffusion_batches = hp.batch_size.min(32);
+            let eval_diffusion_epochs = hp.num_epochs;
+            let eval_diffusion_batches = hp.batch_size.min(32);
 
-        let mut temp_model =
-            DiffusionModel::<Backend>::new(&device, hp.latent_dimen, 3, hp.num_steps);
+            let mut temp_model =
+                DiffusionModel::<Backend>::new(&device, hp.latent_dimen, 3, hp.num_steps);
 
-        let optimizer = AdamConfig::new();
-        let mut temp_optimizer = optimizer.init();
+            let optimizer = AdamConfig::new();
+            let mut temp_optimizer = optimizer.init();
 
-        let mut vae_total_loss = 0.0;
-        let mut vae_count = 0;
+            let mut vae_total_loss = 0.0;
+            let mut vae_count = 0;
 
-        let mut last_images: Option<Tensor<Backend, 4>> = None;
+            let mut last_images: Option<Tensor<Backend, 4>> = None;
 
-        for epoch in 0..eval_vae_epochs {
-            println!("\n Epochs {}/{}", epoch + 1, eval_vae_epochs);
-            let num_batches = (dataset.size + eval_batch_size - 1) / eval_batch_size;
+            for epoch in 0..eval_vae_epochs {
+                println!("\n Epochs {}/{}", epoch + 1, eval_vae_epochs);
+                let num_batches = (dataset.size + eval_batch_size - 1) / eval_batch_size;
 
-            for batch_idx in 0..num_batches {
-                let start_idx = batch_idx * eval_batch_size;
-                let end_idx = (start_idx + eval_batch_size).min(dataset.size);
+                for batch_idx in 0..num_batches {
+                    let start_idx = batch_idx * eval_batch_size;
+                    let end_idx = (start_idx + eval_batch_size).min(dataset.size);
 
-                if end_idx - start_idx < eval_batch_size {
-                    break;
-                }
-
-                let indices: Vec<usize> = (start_idx..end_idx).collect();
-
-                if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
-                    if batch_idx == 0 {
-                        last_images = Some(images.clone());
+                    if end_idx - start_idx < eval_batch_size {
+                        break;
                     }
-                    let kl_weight =
-                        hp.kl_loss_weight * (1.0 + epoch as f64 / eval_vae_epochs as f64);
 
-                    let tensor_loss = temp_model.train_vae(images, kl_weight as f32);
+                    let indices: Vec<usize> = (start_idx..end_idx).collect();
 
-                    let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
-
-                    // Check for NaN/inf and handle early stopping
-                    if loss_val.is_nan() || loss_val.is_infinite() {
-                        consecutive_nan_count += 1;
-                        println!(
-                            " NaN detected in VAE batch {}/{}. Count: {}",
-                            batch_idx, num_batches, consecutive_nan_count
-                        );
-
-                        if consecutive_nan_count >= max_consecutive_nans {
-                            println!(
-                                " Early stopping: {} consecutive NaN losses detected",
-                                consecutive_nan_count
-                            );
-                            nan_detected = true;
-                            break;
+                    if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
+                        if batch_idx == 0 {
+                            last_images = Some(images.clone());
                         }
-                        continue;
-                    } else {
-                        consecutive_nan_count = 0; // Reset counter on valid loss
-                    }
+                        let kl_weight =
+                            hp.kl_loss_weight * (1.0 + epoch as f64 / eval_vae_epochs as f64);
 
-                    // Gradient clipping before step
-                    let grads = tensor_loss.backward();
-                    let grad_params = GradientsParams::from_grads(grads, &temp_model);
+                        let tensor_loss = temp_model.train_vae(images, kl_weight as f32);
 
-                    // Use smaller learning rate if loss is getting large
-                    let adaptive_lr = if loss_val > 10.0 {
-                        hp.learning_rate * 0.1
-                    } else {
-                        hp.learning_rate
-                    };
+                        let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
 
-                    temp_model = temp_optimizer.step(adaptive_lr, temp_model, grad_params);
+                        // Check for NaN/inf and handle early stopping
+                        if loss_val.is_nan() || loss_val.is_infinite() {
+                            consecutive_nan_count += 1;
+                            println!(
+                                " NaN detected in VAE batch {}/{}. Count: {}",
+                                batch_idx, num_batches, consecutive_nan_count
+                            );
 
-                    vae_total_loss += loss_val;
-                    vae_count += 1;
-
-                    if batch_idx % 10 == 0 {
-                        println!(
-                            "  Batch {}/{}: Loss = {:.4}",
-                            batch_idx, num_batches, loss_val
-                        );
-                    }
-                }
-            }
-
-            // Break out of epoch loop if NaN detected
-            if nan_detected {
-                break;
-            }
-
-            let avg_epoch_loss = vae_total_loss / vae_count as f32;
-            println!(
-                "  Eval Epoch {}/{}: Avg Loss = {:.4}",
-                epoch + 1,
-                eval_vae_epochs,
-                avg_epoch_loss
-            );
-
-            if avg_epoch_loss.is_nan() || avg_epoch_loss.is_infinite() {
-                println!("NaN detected in epoch average. Stopping VAE training.");
-                nan_detected = true;
-                break;
-            }
-
-            let current_epoch = epoch + 1;
-
-            if current_epoch % 2 == 0 || current_epoch == 1 {
-                if let Some(ref images) = last_images {
-                    if vae_count > 0 {
-                        let z = temp_model.vae.encode(images.clone());
-                        let reconstructed = temp_model.vae.decode(z);
-
-                        let filename = format!(
-                            "run{}_e{}_lr{:.0e}_kl{:.3}_bs{}_ld{}_loss{:.4}.png",
-                            opt_run_id_str,
-                            current_epoch,
-                            hp.learning_rate,
-                            hp.kl_loss_weight,
-                            hp.batch_size,
-                            hp.latent_dimen,
-                            avg_epoch_loss
-                        );
-                        if let Ok(_) = save_as_image(reconstructed, &filename) {
-                            println!(" Saved reconstruction: {}", filename);
+                            if consecutive_nan_count >= max_consecutive_nans {
+                                println!(
+                                    " Early stopping: {} consecutive NaN losses detected",
+                                    consecutive_nan_count
+                                );
+                                nan_detected = true;
+                                break;
+                            }
+                            continue;
                         } else {
-                            eprintln!(" Failed to save image: {}", filename);
+                            consecutive_nan_count = 0; // Reset counter on valid loss
+                        }
+
+                        // Gradient clipping before step
+                        let grads = tensor_loss.backward();
+                        let grad_params = GradientsParams::from_grads(grads, &temp_model);
+
+                        // Use smaller learning rate if loss is getting large
+                        let adaptive_lr = if loss_val > 10.0 {
+                            hp.learning_rate * 0.1
+                        } else {
+                            hp.learning_rate
+                        };
+
+                        temp_model = temp_optimizer.step(adaptive_lr, temp_model, grad_params);
+
+                        vae_total_loss += loss_val;
+                        vae_count += 1;
+
+                        if batch_idx % 10 == 0 {
+                            println!(
+                                "  Batch {}/{}: Loss = {:.4}",
+                                batch_idx, num_batches, loss_val
+                            );
                         }
                     }
                 }
-            }
-        }
 
-        if vae_count == 0 || nan_detected {
-            println!(
-                " VAE training failed: vae_count={}, nan_detected={}",
-                vae_count, nan_detected
-            );
-            return 100.0; // Tell BO this configuration is bad
-        }
-
-        let vae_loss_ = (vae_total_loss / vae_count as f32) as f64;
-
-        if vae_loss_.is_nan() || vae_loss_.is_infinite() || vae_loss_ > 150.0 {
-            println!(
-                " Invalid final VAE loss: {}. Telling BO to skip this configuration.",
-                vae_loss_
-            );
-            return 100.0; // Return high loss to BO
-        }
-        let vae_loss = vae_loss_.clamp(0.001, 100.0);
-
-        println!("✓ VAE Final loss: {:.6}", vae_loss);
-
-        //Calculating Diffusion Model using Hyperparameters
-        let mut diffusion_total_loss = 0.0;
-        let mut diffusion_count = 0;
-        consecutive_nan_count = 0;
-
-        println!("\n Diffusion Model Training has started with Hyperparameters....");
-
-        for epoch in 0..eval_diffusion_epochs {
-            println!("\n Epochs {}/{}", epoch + 1, eval_diffusion_epochs);
-            let num_batches = (dataset.size + eval_diffusion_batches - 1) / eval_diffusion_batches;
-
-            for batch_idx in 0..num_batches {
-                let start_idx = batch_idx * eval_diffusion_batches;
-                let end_idx = (start_idx + eval_diffusion_batches).min(dataset.size);
-
-                if end_idx - start_idx < eval_batch_size {
+                // Break out of epoch loop if NaN detected
+                if nan_detected {
                     break;
                 }
 
-                let indices: Vec<usize> = (start_idx..end_idx).collect();
+                let avg_epoch_loss = vae_total_loss / vae_count as f32;
+                println!(
+                    "  Eval Epoch {}/{}: Avg Loss = {:.4}",
+                    epoch + 1,
+                    eval_vae_epochs,
+                    avg_epoch_loss
+                );
 
-                if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
-                    let tensor_loss = temp_model.forward(images, &device);
+                if avg_epoch_loss.is_nan() || avg_epoch_loss.is_infinite() {
+                    println!("NaN detected in epoch average. Stopping VAE training.");
+                    nan_detected = true;
+                    break;
+                }
 
-                    let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
+                let current_epoch = epoch + 1;
 
-                    if loss_val.is_nan() || loss_val.is_infinite() || loss_val > 150.0 {
-                        consecutive_nan_count += 1;
-                        println!(
-                            " NaN in diffusion batch {}/{}. Count: {}",
-                            batch_idx, num_batches, consecutive_nan_count
-                        );
+                if current_epoch % 2 == 0 || current_epoch == 1 {
+                    if let Some(ref images) = last_images {
+                        if vae_count > 0 {
+                            let z = temp_model.vae.encode(images.clone());
+                            let reconstructed = temp_model.vae.decode(z);
 
-                        if consecutive_nan_count >= max_consecutive_nans {
-                            println!(
-                                "Early stopping diffusion: {} consecutive NaN losses",
-                                consecutive_nan_count
+                            let filename = format!(
+                                "run{}_e{}_lr{:.0e}_kl{:.3}_bs{}_ld{}_loss{:.4}.png",
+                                opt_run_id_str,
+                                current_epoch,
+                                hp.learning_rate,
+                                hp.kl_loss_weight,
+                                hp.batch_size,
+                                hp.latent_dimen,
+                                avg_epoch_loss
                             );
-                            nan_detected = true;
-                            break;
+                            if let Ok(_) = save_as_image(reconstructed, &filename) {
+                                println!(" Saved reconstruction: {}", filename);
+                            } else {
+                                eprintln!(" Failed to save image: {}", filename);
+                            }
                         }
-                        continue;
-                    } else {
-                        consecutive_nan_count = 0;
-                    }
-
-                    let grads = tensor_loss.backward();
-                    let grad_params = GradientsParams::from_grads(grads, &temp_model);
-                    let lr = hp.learning_rate * 0.99_f64.powi(epoch as i32);
-                    temp_model = temp_optimizer.step(lr, temp_model, grad_params);
-
-                    diffusion_total_loss += loss_val;
-                    diffusion_count += 1;
-
-                    if batch_idx % 10 == 0 {
-                        println!(
-                            "  Batch {}/{}: Loss = {:.4}",
-                            batch_idx, num_batches, loss_val
-                        );
                     }
                 }
             }
 
-            // Break out if NaN detected
-            if nan_detected {
-                break;
+            if vae_count == 0 || nan_detected {
+                println!(
+                    " VAE training failed: vae_count={}, nan_detected={}",
+                    vae_count, nan_detected
+                );
+                return 100.0; // Tell BO this configuration is bad
             }
 
-            let avg_epoch_loss_diffusion = diffusion_total_loss / diffusion_count as f32;
-            println!(
-                "  Eval Epoch {}/{}: Avg Loss = {:.4}",
-                epoch + 1,
-                eval_diffusion_epochs,
-                avg_epoch_loss_diffusion
-            );
+            let vae_loss_ = (vae_total_loss / vae_count as f32) as f64;
 
-            // Check epoch average for NaN
-            if avg_epoch_loss_diffusion.is_nan() || avg_epoch_loss_diffusion.is_infinite() {
-                println!("NaN in diffusion epoch average. Stopping.");
-                nan_detected = true;
-                break;
+            if vae_loss_.is_nan() || vae_loss_.is_infinite() || vae_loss_ > 150.0 {
+                println!(
+                    " Invalid final VAE loss: {}. Telling BO to skip this configuration.",
+                    vae_loss_
+                );
+                return 100.0; // Return high loss to BO
             }
+            let vae_loss = vae_loss_.clamp(0.001, 100.0);
 
-            if (epoch + 1) % 10 == 0 {
-                println!("\n Generating sample images...");
-                let generated = temp_model.denoising_process(4, &device);
+            println!("✓ VAE Final loss: {:.6}", vae_loss);
 
-                for i in 0..1 {
-                    let single_image = generated.clone().slice([i..i + 1]);
-                    if let Ok(_) = save_as_image(
-                        single_image,
-                        &format!("generated_epoch_diffusion {}_sample{}.png", epoch + 1, i),
-                    ) {
-                        println!(" Saved sample {} for epoch_diffusion {}", i, epoch + 1);
+            //Calculating Diffusion Model using Hyperparameters
+            let mut diffusion_total_loss = 0.0;
+            let mut diffusion_count = 0;
+            consecutive_nan_count = 0;
+
+            println!("\n Diffusion Model Training has started with Hyperparameters....");
+
+            for epoch in 0..eval_diffusion_epochs {
+                println!("\n Epochs {}/{}", epoch + 1, eval_diffusion_epochs);
+                let num_batches =
+                    (dataset.size + eval_diffusion_batches - 1) / eval_diffusion_batches;
+
+                for batch_idx in 0..num_batches {
+                    let start_idx = batch_idx * eval_diffusion_batches;
+                    let end_idx = (start_idx + eval_diffusion_batches).min(dataset.size);
+
+                    if end_idx - start_idx < eval_batch_size {
+                        break;
+                    }
+
+                    let indices: Vec<usize> = (start_idx..end_idx).collect();
+
+                    if let Ok(images) = dataset.get_batch::<Backend>(&indices, &device) {
+                        let tensor_loss = temp_model.forward(images, &device);
+
+                        let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
+
+                        if loss_val.is_nan() || loss_val.is_infinite() || loss_val > 150.0 {
+                            consecutive_nan_count += 1;
+                            println!(
+                                " NaN in diffusion batch {}/{}. Count: {}",
+                                batch_idx, num_batches, consecutive_nan_count
+                            );
+
+                            if consecutive_nan_count >= max_consecutive_nans {
+                                println!(
+                                    "Early stopping diffusion: {} consecutive NaN losses",
+                                    consecutive_nan_count
+                                );
+                                nan_detected = true;
+                                break;
+                            }
+                            continue;
+                        } else {
+                            consecutive_nan_count = 0;
+                        }
+
+                        let grads = tensor_loss.backward();
+                        let grad_params = GradientsParams::from_grads(grads, &temp_model);
+                        let lr = hp.learning_rate * 0.99_f64.powi(epoch as i32);
+                        temp_model = temp_optimizer.step(lr, temp_model, grad_params);
+
+                        diffusion_total_loss += loss_val;
+                        diffusion_count += 1;
+
+                        if batch_idx % 10 == 0 {
+                            println!(
+                                "  Batch {}/{}: Loss = {:.4}",
+                                batch_idx, num_batches, loss_val
+                            );
+                        }
+                    }
+                }
+
+                // Break out if NaN detected
+                if nan_detected {
+                    break;
+                }
+
+                let avg_epoch_loss_diffusion = diffusion_total_loss / diffusion_count as f32;
+                println!(
+                    "  Eval Epoch {}/{}: Avg Loss = {:.4}",
+                    epoch + 1,
+                    eval_diffusion_epochs,
+                    avg_epoch_loss_diffusion
+                );
+
+                // Check epoch average for NaN
+                if avg_epoch_loss_diffusion.is_nan() || avg_epoch_loss_diffusion.is_infinite() {
+                    println!("NaN in diffusion epoch average. Stopping.");
+                    nan_detected = true;
+                    break;
+                }
+
+                if (epoch + 1) % 10 == 0 {
+                    println!("\n Generating sample images...");
+                    let generated = temp_model.denoising_process(4, &device);
+
+                    for i in 0..1 {
+                        let single_image = generated.clone().slice([i..i + 1]);
+                        if let Ok(_) = save_as_image(
+                            single_image,
+                            &format!("generated_epoch_diffusion {}_sample{}.png", epoch + 1, i),
+                        ) {
+                            println!(" Saved sample {} for epoch_diffusion {}", i, epoch + 1);
+                        }
                     }
                 }
             }
-        }
 
-        let diffusion_loss = (diffusion_total_loss / diffusion_count as f32) as f64;
+            let diffusion_loss = (diffusion_total_loss / diffusion_count as f32) as f64;
 
-        //Final NaN check for diffusion loss
-        if diffusion_loss.is_nan() || diffusion_loss.is_infinite() || diffusion_loss > 100.0 {
+            //Final NaN check for diffusion loss
+            if diffusion_loss.is_nan() || diffusion_loss.is_infinite() || diffusion_loss > 100.0 {
+                println!(
+                    " Invalid final diffusion loss: {}. Configuration rejected.",
+                    diffusion_loss
+                );
+                return 100.0;
+            }
+
+            let combined_loss = vae_loss * 0.3 + diffusion_loss * 0.7;
+
             println!(
-                " Invalid final diffusion loss: {}. Configuration rejected.",
-                diffusion_loss
+                "✓ VAE Loss: {:.6}, Diffusion Loss: {:.6}, Combined: {:.6}",
+                vae_loss, diffusion_loss, combined_loss
             );
-            return 100.0;
-        }
 
-        let combined_loss = vae_loss * 0.3 + diffusion_loss * 0.7;
-
-        println!(
-            "✓ VAE Loss: {:.6}, Diffusion Loss: {:.6}, Combined: {:.6}",
-            vae_loss, diffusion_loss, combined_loss
-        );
-
-        -combined_loss.clamp(0.001, 100.0)
-    }).unwrap();
+            -combined_loss.clamp(0.001, 100.0)
+        })
+        .unwrap();
     // Create model with optimized hyperparameters
 
     println!("\n Selected the best Hyperparameters from the choices...");

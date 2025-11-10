@@ -762,7 +762,7 @@ impl<B: Backend> DiffusionModel<B> {
         // Final NaN check
         let loss_val = total_loss.clone().into_scalar().elem::<f32>();
         if loss_val.is_nan() || loss_val.is_infinite() {
-            return Tensor::from_floats([100.0], &x.device());
+            return Tensor::from_floats([100.0], device);
         }
 
         total_loss
@@ -1431,6 +1431,7 @@ fn main() {
 
             for epoch in 0..eval_diffusion_epochs {
                 println!("\n Epochs {}/{}", epoch + 1, eval_diffusion_epochs);
+                nan_detected = false;
                 let num_batches =
                     (dataset.size + eval_diffusion_batches - 1) / eval_diffusion_batches;
 

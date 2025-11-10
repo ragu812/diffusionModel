@@ -13,13 +13,8 @@ use burn::tensor::Tensor;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use std::path::PathBuf;
 
-use egobox_doe::{Lhs, SamplingMethod};
-use egobox_ego::{EgorBuilder, InfillOptimizer, InfillStrategy};
-use egobox_moe::GpMixture;
-use linfa::traits::Fit;
-use linfa::Dataset;
-use ndarray::{array, Array2, ArrayView2};
-use std::sync::Arc;
+use pyo3::prelude::*;
+use pyo3::types::PyList;
 
 #[derive(Module, Debug)]
 pub struct SimpleEncoder<B: Backend> {
@@ -652,7 +647,7 @@ impl<B: Backend> DiffusionModel<B> {
         // Final safety check
         let loss_val = diffusion_loss.clone().into_scalar().elem::<f32>();
         if loss_val.is_nan() || loss_val.is_infinite() {
-            return Tensor::from_floats([100.0], device).reshape([1]);
+            return Tensor<B,1>::from_floats([100.0], device).reshape([1]);
         }
 
         diffusion_loss.reshape([1])
@@ -772,46 +767,6 @@ impl<B: Backend> DiffusionModel<B> {
 
         total_loss
     }
-}
-
-// Helper function to validate model parameters for NaN/Inf
-fn validate_tensor_batch<B: Backend>(tensor: &Tensor<B, 4>, name: &str) -> bool {
-    let sample_vals: Vec<f32> = tensor
-        .clone()
-        .slice([0..1.min(tensor.dims()[0]), 0..1, 0..1, 0..1])
-        .flatten(0, 3)
-        .to_data()
-        .to_vec()
-        .unwrap_or_else(|_| vec![f32::NAN]);
-
-    for val in sample_vals {
-        if val.is_nan() || val.is_infinite() {
-            println!("⚠ NaN/Inf detected in {}", name);
-            return false;
-        }
-    }
-    true
-}
-
-// Validate loss tensor specifically
-fn validate_loss<B: Backend>(loss: &Tensor<B, 1>, name: &str) -> bool {
-    let loss_val = loss.clone().into_scalar().elem::<f32>();
-    if loss_val.is_nan() || loss_val.is_infinite() {
-        println!("⚠ Invalid {} loss: {}", name, loss_val);
-        return false;
-    }
-    if loss_val > 1000.0 {
-        println!("⚠ Extremely high {} loss: {}", name, loss_val);
-        return false;
-    }
-    true
-}
-
-// Check model gradients for explosion
-fn check_gradient_health<B: Backend>(model: &DiffusionModel<B>) -> bool {
-    // This is a simplified check - in practice you'd iterate through parameters
-    // For now, we'll rely on the loss validation
-    true
 }
 
 pub fn save_model<B: Backend>(
@@ -1102,6 +1057,61 @@ impl Image {
     }
 }
 
+pub struct Bayesian{
+    py_optimizer: Py<PyAny>
+}
+
+impl Bayesian{
+
+    fn new(bounds: Vec<(f64,f64)>, n_iterations: usize) -> PyResult<Self>{
+        Python::with_gil(|py|{
+
+            let sys = py.import("sys")?;
+            let path = sys.getattr("path")?;
+            path.call_method1("append",(".",))?;
+
+            let bo_module = py.import("bayesian")?;
+            let bo_class = bo_module.getattr("Bayesian")?;
+            let py_bounds = PyList::new(py, &bounds);
+
+            let py_optimizer = bo_class.call1((py_bounds,n_iterations))?;
+
+            Ok(Self{
+                py_optimizer:py_optimizer.into(),
+            })
+        })
+    }
+
+    fn suggest(&self) -> PyResult<Vec<f64>> {
+        Python::with_gil(|py| {
+            let optimizer = self.py_optimizer.as_ref(py);
+            let result = optimizer.call_method0("suggest")?;
+            result.extract()
+        })
+    }
+
+    fn observe(&self, params: Vec<f64>, score: f64) -> PyResult<()> {
+        Python::with_gil(|py| {
+            let optimizer = self.py_optimizer.as_ref(py);
+            let py_params = PyList::new(py, &params);
+            optimizer.call_method1("observe", (py_params, score))?;
+            Ok(())
+        })
+    }
+
+    fn get_best(&self) -> PyResult<(Vec<f64>, f64)> {
+        Python::with_gil(|py| {
+            let optimizer = self.py_optimizer.as_ref(py);
+            let result = optimizer.call_method0("get_best")?;
+
+            let best_params: Vec<f64> = result.get_item(0)?.extract()?;
+            let best_score: f64 = result.get_item(1)?.extract()?;
+
+            Ok((best_params, best_score))
+        })
+    }
+}
+
 pub fn train_ldm_epoch<B: Backend>(
     model: &DiffusionModel<B>,
     dataset: &Image,
@@ -1133,192 +1143,6 @@ pub fn train_ldm_epoch<B: Backend>(
     total_loss / num_batches as f32
 }
 
-pub struct Hyperparameters {
-    pub learning_rate: f64,
-    pub kl_loss_weight: f64,
-    pub batch_size: usize,
-    pub latent_dimen: usize,
-    pub num_steps: usize,
-    pub vae_epochs: usize,
-    pub num_epochs: usize,
-}
-
-impl Hyperparameters {
-    pub fn array(srr: &[f64]) -> Self {
-        Self {
-            learning_rate: srr[0],
-            kl_loss_weight: srr[1],
-            batch_size: srr[2].round() as usize,
-            latent_dimen: srr[3].round() as usize,
-            num_steps: srr[4].round() as usize,
-            vae_epochs: srr[5].round() as usize,
-            num_epochs: srr[6].round() as usize,
-        }
-    }
-
-    pub fn to_array(&self) -> Vec<f64> {
-        vec![
-            self.learning_rate,
-            self.kl_loss_weight,
-            self.batch_size as f64,
-            self.latent_dimen as f64,
-            self.num_steps as f64,
-            self.vae_epochs as f64,
-            self.num_epochs as f64,
-        ]
-    }
-}
-
-pub struct Bayesian {
-    pub n_iter: usize,
-    pub n_initial_points: usize,
-}
-
-impl Bayesian {
-    pub fn new(n_iter: usize, n_initial_points: usize) -> Self {
-        Self {
-            n_iter,
-            n_initial_points,
-        }
-    }
-
-    // Optimize all hyperparameters
-    pub fn optimize<F>(&self, objective: F) -> Hyperparameters
-    where
-        F: Fn(&[f64]) -> f64,
-    {
-        println!("\n Starting Bayesian Optimization");
-        println!("Optimizing 7 hyperparameters:");
-        println!("  1. Learning Rate (1e-6 to 1e-3)");
-        println!("  2. KL Weight (0.001 to 0.1)");
-        println!("  3. Batch Size (16 to 64)");
-        println!("  4. Latent Dimension (8 to 32)");
-        println!("  5. Diffusion Timesteps (100 to 1000)");
-        println!("  6. VAE Epochs (50 to 500)");
-        println!("  7. Diffusion Epochs (50 to 300)");
-
-        let xlimits = array![
-            [1e-6, 1e-3],
-            [0.001, 0.1],
-            [16.0, 64.0],
-            [8.0, 32.0],
-            [100.0, 1000.0],
-            [50.0, 150.0],
-            [50.0, 300.0]
-        ];
-
-        // Create initial sampling using Latin Hypercube Sampling
-        let doe = Lhs::new(&xlimits).denoising_process(self.n_initial_points);
-
-        let mut x_data = doe.clone();
-        let mut y_data: Array2<f64> = Array2::zeros((self.n_initial_points, 1));
-
-        for i in 0..self.n_initial_points {
-            let params = doe.row(i).to_vec();
-            let hyperparams = Hyperparameters::array(&params);
-
-            println!("\n Initial Point {}/{} ", i + 1, self.n_initial_points);
-            println!(
-                "  lr={:.6}, kl={:.4}, batch={}, latent={}, timesteps={}, vae_ep={}, diff_ep={}",
-                hyperparams.learning_rate,
-                hyperparams.kl_loss_weight,
-                hyperparams.batch_size,
-                hyperparams.latent_dimen,
-                hyperparams.num_steps,
-                hyperparams.vae_epochs,
-                hyperparams.num_epochs
-            );
-
-            let loss = objective(&params);
-            y_data[[i, 0]] = loss;
-            println!("  Loss: {:.4}", loss);
-        }
-
-        // Build and iterate with Gaussian Process
-        for iter in 0..self.n_iter {
-            println!("\n BO Iteration {}/{}", iter + 1, self.n_iter);
-
-            let dataset_1 = Dataset::new(x_data.clone(), y_data.clone());
-            let gp = Arc::new(
-                GpMixture::params()
-                    .n_clusters(1)
-                    .fit(&dataset_1)
-                    .expect("GP fitting failed"),
-            );
-
-            // Find next point using Expected Improvement
-            let gp_clone = Arc::clone(&gp);
-            let optimizer = EgorBuilder::optimize(move |x: &ArrayView2<f64>| -> Array2<f64> {
-                gp_clone.predict(x).expect("Prediction failed")
-            });
-
-            let optimizer = optimizer.configure(|config| {
-                config
-                    .doe(&x_data)
-                    .infill_strategy(InfillStrategy::EI)
-                    .infill_optimizer(InfillOptimizer::Cobyla)
-                    .regression_spec(egobox_moe::RegressionSpec::CONSTANT)
-                    .correlation_spec(egobox_moe::CorrelationSpec::SQUAREDEXPONENTIAL)
-                    .n_doe(100)
-                    .max_iters(1)
-            });
-
-            let egor = optimizer
-                .min_within(&xlimits)
-                .run()
-                .expect("Optimization failed");
-
-            let x_opt = egor.x_opt.to_vec();
-            let hyperparams = Hyperparameters::array(&x_opt);
-
-            println!("  Next evaluation:");
-            println!(
-                "    lr={:.6}, kl={:.4}, batch={}, latent={}, timesteps={}, vae_ep={}, diff_ep={}",
-                hyperparams.learning_rate,
-                hyperparams.kl_loss_weight,
-                hyperparams.batch_size,
-                hyperparams.latent_dimen,
-                hyperparams.num_steps,
-                hyperparams.vae_epochs,
-                hyperparams.num_epochs
-            );
-
-            let y_opt = objective(&x_opt);
-            println!("    Loss: {:.4}", y_opt);
-
-            // Add new point to dataset
-            let new_x = Array2::from_shape_vec((1, 7), x_opt).expect("Shape error");
-            let new_y = array![[y_opt]];
-
-            x_data = ndarray::concatenate![ndarray::Axis(0), x_data, new_x];
-            y_data = ndarray::concatenate![ndarray::Axis(0), y_data, new_y];
-        }
-
-        // Find best parameters
-        let best_idx = y_data
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(idx, _)| idx)
-            .unwrap();
-
-        let best_parameter: Vec<f64> = (0..7).map(|j| x_data[[best_idx, j]]).collect();
-        let best_hyperparameter = Hyperparameters::array(&best_parameter);
-        let best_loss = y_data[[best_idx, 0]];
-
-        println!("Best hyperparameters found:");
-        println!("  Learning Rate: {:.6}", best_hyperparameter.learning_rate);
-        println!("  KL Weight: {:.4}", best_hyperparameter.kl_loss_weight);
-        println!("  Batch Size: {}", best_hyperparameter.batch_size);
-        println!("  Latent Dimension: {}", best_hyperparameter.latent_dimen);
-        println!("  Diffusion Timesteps: {}", best_hyperparameter.num_steps);
-        println!("  VAE Epochs: {}", best_hyperparameter.vae_epochs);
-        println!("  Diffusion Epochs: {}", best_hyperparameter.num_epochs);
-        println!("  Best Loss: {:.4}", best_loss);
-
-        best_hyperparameter
-    }
-}
 
 pub fn save_as_image<B: Backend>(
     tensor: Tensor<B, 4>,
@@ -1358,11 +1182,11 @@ fn main() {
     println!("Using device: {:?}", device);
 
     let augmentation = Augmentation::new()
-        .with_horizontal(true)
-        .with_vertical(false)
-        .with_rotation(true)
-        .with_brightness(0.2)
-        .with_contrast(0.2);
+        .horizontal(true)
+        .vertical(false)
+        .rotation(true)
+        .brightness(0.2)
+        .contrast(0.2);
 
     // Load dataset with augmentation
     let dataset = Image::directory(r"Pictures", 64, 64)
@@ -1540,7 +1364,7 @@ fn main() {
 
         let vae_loss_ = (vae_total_loss / vae_count as f32) as f64;
 
-        if vae_loss_.is_nan() || vae_loss_.is_infinite() || vae_loss > 150.0{
+        if vae_loss_.is_nan() || vae_loss_.is_infinite() || vae_loss_ > 150.0 {
             println!(
                 " Invalid final VAE loss: {}. Telling BO to skip this configuration.",
                 vae_loss_

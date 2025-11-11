@@ -1322,6 +1322,17 @@ fn main() {
         dataset.size
     );
 
+    // Detect and set Python from bayesian/.venv if it exists
+    let current_dir = std::env::current_dir().unwrap();
+    let venv_python = if std::env::consts::OS == "windows" {
+        current_dir.join("bayesian").join(".venv").join("Scripts").join("python.exe")
+    } else {
+        current_dir.join("bayesian").join(".venv").join("bin").join("python")
+    };
+    if venv_python.exists() {
+        std::env::set_var("PYO3_PYTHON", venv_python);
+    }
+
     let bounds = vec![
         (0.0001, 0.1),
         (0.001, 0.1),

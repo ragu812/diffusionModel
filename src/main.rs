@@ -1138,7 +1138,9 @@ impl Bayesian {
         Python::with_gil(|py| {
             let sys = py.import("sys")?;
             let path = sys.getattr("path")?;
-            path.call_method1("append", ("bayesian",))?;
+            let current_dir = std::env::current_dir().unwrap();
+            let bayesian_path = current_dir.join("bayesian");
+            path.call_method1("append", (bayesian_path.to_str().unwrap(),))?;
 
             let bo_module = py.import("bayesian")?;
             let bo_class = bo_module.getattr("BayesianLDM")?;

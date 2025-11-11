@@ -11,4 +11,6 @@ dependencies = [
     "torch>=2.9.0",
     "torchaudio>=2.9.0",
     "torchvision>=0.24.0",
+    "botorch>=0.12.0",
+    "gpytorch>=1.13",
 ]

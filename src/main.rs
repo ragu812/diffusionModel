@@ -1137,7 +1137,9 @@ impl Bayesian {
         Python::with_gil(|py| {
             let sys = py.import("sys")?;
             let path = sys.getattr("path")?;
-            path.call_method1("append", ("bayesian",))?;
+            let current_dir = std::env::current_dir().unwrap();
+            let bayesian_path = current_dir.join("bayesian");
+            path.call_method1("append", (bayesian_path.to_str().unwrap(),))?;
 
             let bo_module = py.import("bayesian")?;
             let bo_class = bo_module.getattr("BayesianLDM")?;
@@ -1306,6 +1308,7 @@ fn main() {
         .contrast(0.2);
 
     // Load dataset with augmentation
+    let dataset = Image::directory(r"C:\Users\M.KUMAR\Downloads\diffusionModel\Pictures", 64, 64)
     let dataset = Image::directory(r"/home/raghunesh/Downloads/my_burn/Pictures", 64, 64)
         .unwrap()
         .with_augmentation(augmentation);

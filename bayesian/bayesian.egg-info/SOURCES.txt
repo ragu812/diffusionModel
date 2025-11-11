@@ -1,0 +1,8 @@
+README.md
+main.py
+pyproject.toml
+bayesian.egg-info/PKG-INFO
+bayesian.egg-info/SOURCES.txt
+bayesian.egg-info/dependency_links.txt
+bayesian.egg-info/requires.txt
+bayesian.egg-info/top_level.txt

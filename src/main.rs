@@ -624,7 +624,8 @@ impl<B: Backend> DiffusionModel<B> {
         // Check for NaN in noisy latent
         let z_sample = z_noisy.clone().into_scalar().elem::<f32>();
         if z_sample.is_nan() || z_sample.is_infinite() {
-            return Tensor::from_floats([100.0], device).reshape([1]);
+            let tensor: Tensor<B, 1> = Tensor::from_floats([100.0], device);
+            return tensor.reshape([1]);
         }
 
         let t_emb = sin_time_addition(device, t, 256);
@@ -634,7 +635,8 @@ impl<B: Backend> DiffusionModel<B> {
         // Check for NaN in noise prediction
         let pred_sample = noise_pred.clone().into_scalar().elem::<f32>();
         if pred_sample.is_nan() || pred_sample.is_infinite() {
-            return Tensor::from_floats([100.0], device).reshape([1]);
+            let tensor: Tensor<B, 1> = Tensor::from_floats([100.0], device);
+            return tensor.reshape([1]);
         }
 
         let noise_pred_2d: Tensor<B, 2> = noise_pred.flatten(1, 3);
@@ -647,7 +649,8 @@ impl<B: Backend> DiffusionModel<B> {
         // Final safety check
         let loss_val = diffusion_loss.clone().into_scalar().elem::<f32>();
         if loss_val.is_nan() || loss_val.is_infinite() {
-            return Tensor::from_floats([100.0], device).reshape([1]);
+            let tensor: Tensor<B, 1> = Tensor::from_floats([100.0], device);
+            return tensor.reshape([1]);
         }
 
         diffusion_loss.reshape([1])
@@ -809,11 +812,6 @@ impl<B: Backend> DiffusionModel<B> {
 
         // Final NaN check
         let loss_val = total_loss.clone().into_scalar().elem::<f32>();
-        if loss_val.is_nan() || loss_val.is_infinite() {
-            return Tensor::from_floats([100.0], device);
-        }
-
-        total_loss
     }
 }
 
@@ -1146,7 +1144,7 @@ impl Bayesian {
             let bo_class = bo_module.getattr("BayesianLDM")?;
             let py_bounds = PyList::empty(py);
             for bound in &bounds {
-                py_bounds.append(bound.into_py(py))?;
+                py_bounds.push(bound.into_py(py))?;
             }
 
             let py_optimizer = bo_class.call((py_bounds, n_iterations), None)?;

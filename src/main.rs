@@ -1,6 +1,7 @@
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::Module;
 use burn::nn::conv::{Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig};
+use burn::nn::pool::{Dropout, DropoutConfig, MaxPool2d, MaxPool2dConfig};
 use burn::nn::{BatchNorm, BatchNormConfig, Initializer, Linear, LinearConfig, PaddingConfig2d};
 use burn::optim::decay::WeightDecayConfig;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
@@ -26,6 +27,7 @@ pub struct SimpleEncoder<B: Backend> {
     bn_3: BatchNorm<B, 2>,
     mean: Linear<B>,
     variance: Linear<B>,
+    drop: Dropout,
     latent_dimen: usize,
 }
 
@@ -64,6 +66,7 @@ impl<B: Backend> SimpleEncoder<B> {
 
             mean: LinearConfig::new(128 * 16 * 16, latent_dimen * 16).init(device),
             variance: LinearConfig::new(128 * 16 * 16, latent_dimen * 16).init(device),
+            drop: DropoutConfig::new(0.5).init(),
             latent_dimen,
         }
     }
@@ -80,6 +83,8 @@ impl<B: Backend> SimpleEncoder<B> {
 
         let x = x.flatten(1, 3);
 
+        let x = self.drop.forward(x);
+
         let mean = self.mean.forward(x.clone());
         let variance = self.variance.forward(x.clone());
 
@@ -89,6 +94,7 @@ impl<B: Backend> SimpleEncoder<B> {
 #[derive(Module, Debug)]
 pub struct SimpleDecoder<B: Backend> {
     transfer: Linear<B>,
+    drop1: Dropout,
     reverse1: ConvTranspose2d<B>,
     bn_1: BatchNorm<B, 2>,
     reverse2: ConvTranspose2d<B>,
@@ -102,6 +108,8 @@ impl<B: Backend> SimpleDecoder<B> {
     pub fn new(output: usize, latent_dimen: usize, device: &B::Device) -> Self {
         Self {
             transfer: LinearConfig::new(latent_dimen * 16, 128 * 16 * 16).init(device),
+
+            drop1: DropoutConfig::new(0.5).init(),
 
             reverse1: ConvTranspose2dConfig::new([128, 64], [4, 4])
                 .with_stride([2, 2])
@@ -141,6 +149,9 @@ impl<B: Backend> SimpleDecoder<B> {
         let input2_flat: Tensor<B, 2> = input2.flatten(1, 3);
         let y = self.transfer.forward(input2_flat);
         let y = activation::relu(y);
+
+        let y = self.drop1.forward(y);
+
         let batch_size = y.dims()[0];
         let y = y.reshape([batch_size, 128, 16, 16]);
 
@@ -378,14 +389,17 @@ impl<B: Backend> ResidualBlock<B> {
 pub struct Unet<B: Backend> {
     down1: Conv2d<B>,
     down_res1: ResidualBlock<B>,
+    pool1: MaxPool2d,
     down2: Conv2d<B>,
     down_res2: ResidualBlock<B>,
+    pool2: MaxPool2d,
     down3: Conv2d<B>,
     down_res3: ResidualBlock<B>,
 
     mid_res1: ResidualBlock<B>,
     mid_res2: ResidualBlock<B>,
     mid_atten: Attention<B>,
+    mid_drop: Dropout,
 
     up1: ConvTranspose2d<B>,
     up_conv1: Conv2d<B>,
@@ -414,6 +428,7 @@ impl<B: Backend> Unet<B> {
                 })
                 .init(device),
             down_res1: ResidualBlock::new(device, 64, time_emb_dim),
+            pool1: MaxPool2dConfig::new([2, 2]).with_strides([2, 2]).init(),
 
             down2: Conv2dConfig::new([64, 128], [3, 3])
                 .with_stride([2, 2])
@@ -424,6 +439,7 @@ impl<B: Backend> Unet<B> {
                 })
                 .init(device),
             down_res2: ResidualBlock::new(device, 128, time_emb_dim),
+            pool2: MaxPool2dConfig::new([2, 2]).with_strides([2, 2]).init(),
 
             down3: Conv2dConfig::new([128, 256], [3, 3])
                 .with_stride([2, 2])
@@ -438,6 +454,7 @@ impl<B: Backend> Unet<B> {
             mid_res1: ResidualBlock::new(device, 256, time_emb_dim),
             mid_res2: ResidualBlock::new(device, 256, time_emb_dim),
             mid_atten: Attention::new(256, device),
+            mid_drop: DropoutConfig::new(0.5).init(),
 
             up1: ConvTranspose2dConfig::new([256, 128], [4, 4])
                 .with_stride([2, 2])
@@ -481,15 +498,18 @@ impl<B: Backend> Unet<B> {
         let down_1 = self.down1.forward(x);
         let down_1 = self.down_res1.forward(down_1, time_embed.clone());
 
-        let down_2 = self.down2.forward(down_1.clone());
+        let down_2_input = self.pool1.forward(down_1.clone());
+        let down_2 = self.down2.forward(down_2_input.clone());
         let down_2 = self.down_res2.forward(down_2, time_embed.clone());
 
-        let down_3 = self.down3.forward(down_2.clone());
+        let down_3_input = self.pool2.forward(down_2.clone());
+        let down_3 = self.down3.forward(down_3_input.clone());
         let down_3 = self.down_res3.forward(down_3, time_embed.clone());
 
         let mut m = self.mid_res1.forward(down_3, time_embed.clone());
         m = self.mid_atten.forward(m);
         m = self.mid_res2.forward(m, time_embed.clone());
+        m = self.mid_drop.forward(m);
 
         let u1 = self.up1.forward(m);
         let u1 = Tensor::cat(vec![u1, down_2.clone()], 1);
@@ -1318,15 +1338,12 @@ fn main() {
     );
 
     // Detect and set Python from bayesian/.venv if it exists
-    let current_dir = std::env::current_dir().unwrap();
-    let venv_python = if std::env::consts::OS == "windows" {
-        current_dir.join("bayesian").join(".venv").join("Scripts").join("python.exe")
-    } else {
-        current_dir.join("bayesian").join(".venv").join("bin").join("python")
-    };
-    if venv_python.exists() {
-        std::env::set_var("PYO3_PYTHON", venv_python);
-    }
+    // let current_dir = std::env::current_dir().unwrap();
+    // let venv_python = current_dir.join("bayesian").join(".venv").join("bin").join("python");
+
+    // if venv_python.exists() {
+    //     std::env::set_var("PYO3_PYTHON", venv_python);
+    // }
 
     let bounds = vec![
         (0.001, 0.1),

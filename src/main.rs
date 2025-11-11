@@ -810,8 +810,7 @@ impl<B: Backend> DiffusionModel<B> {
         let kl_loss_1d: Tensor<B, 1> = kl_loss.mul_scalar(kl_weight.clamp(0.0, 1.0)).reshape([1]);
         let total_loss = recon_loss + kl_loss_1d;
 
-        // Final NaN check
-        let loss_val = total_loss.clone().into_scalar().elem::<f32>();
+        total_loss
     }
 }
 
@@ -1142,11 +1141,7 @@ impl Bayesian {
 
             let bo_module = py.import("bayesian")?;
             let bo_class = bo_module.getattr("BayesianLDM")?;
-            let py_bounds = PyList::empty(py);
-            for bound in &bounds {
-                py_bounds.push(bound.into_py(py))?;
-            }
-
+            let py_bounds = PyList::new(py, &bounds);
             let py_optimizer = bo_class.call((py_bounds, n_iterations), None)?;
 
             Ok(Self {
@@ -1305,7 +1300,7 @@ fn main() {
 
     let augmentation = Augmentation::new()
         .horizontal(true)
-        .vertical(false)
+        .vertical(true)
         .rotation(true)
         .brightness(0.2)
         .contrast(0.2);
@@ -1321,8 +1316,8 @@ fn main() {
     );
 
     let bounds = vec![
-        (0.0001, 0.1),
         (0.001, 0.1),
+        (0.01, 0.1),
         (16.0, 64.0),
         (12.0, 64.0),
         (150.0, 1200.0),
@@ -1473,7 +1468,7 @@ fn main() {
                     " VAE training failed: vae_count={}, nan_detected={}",
                     vae_count, nan_detected
                 );
-                return 100.0; 
+                return 100.0;
             }
 
             let vae_loss_ = (vae_total_loss / vae_count as f32) as f64;

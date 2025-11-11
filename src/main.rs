@@ -1306,7 +1306,7 @@ fn main() {
         .contrast(0.2);
 
     // Load dataset with augmentation
-    let dataset = Image::directory(r"Pictures", 64, 64)
+    let dataset = Image::directory(r"/home/raghunesh/Downloads/my_burn/Pictures", 64, 64)
         .unwrap()
         .with_augmentation(augmentation);
 

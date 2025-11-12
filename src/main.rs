@@ -1163,7 +1163,7 @@ impl Bayesian {
             let bayesian_path = current_dir.join("bayesian");
             path.call_method1("append", (bayesian_path.to_str().unwrap(),))?;
 
-            let bo_module = py.import("bayesian")?;
+            let bo_module = py.import("main")?;
             let bo_class = bo_module.getattr("BayesianLDM")?;
             let py_bounds = PyList::new(py, &bounds);
             let py_optimizer = bo_class.call((py_bounds, n_iterations), None)?;
@@ -1339,13 +1339,13 @@ fn main() {
         dataset.size
     );
 
-    // Detect and set Python from bayesian/.venv if it exists
-    // let current_dir = std::env::current_dir().unwrap();
-    // let venv_python = current_dir.join("bayesian").join(".venv").join("bin").join("python");
+     Detect and set Python from bayesian/.venv if it exists
+     let current_dir = std::env::current_dir().unwrap();
+     let venv_python = current_dir.join("bayesian").join(".venv").join("bin").join("python");
 
-    // if venv_python.exists() {
-    //     std::env::set_var("PYO3_PYTHON", venv_python);
-    // }
+     if venv_python.exists() {
+         std::env::set_var("PYO3_PYTHON", venv_python);
+     }
 
     let bounds = vec![
         (0.001, 0.1),

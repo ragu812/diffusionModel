@@ -13,6 +13,7 @@ use burn::tensor::Int;
 use burn::tensor::Tensor;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use std::path::PathBuf;
+use std::time;
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -539,10 +540,11 @@ impl<B: Backend> DiffusionModel<B> {
         latent_dimen: usize,
         in_channels: usize,
         num_time: usize,
+        time_embed_dim: usize,
     ) -> Self {
         Self {
             vae: Vae::new(in_channels, latent_dimen, device),
-            unet: Unet::new(device, latent_dimen, 256),
+            unet: Unet::new(device, latent_dimen, time_embed_dim),
             num_time,
             latent_dimen,
         }
@@ -854,8 +856,8 @@ pub fn load_model<B: Backend>(
     let recorder = CompactRecorder::new();
     let record = recorder.load(path.into(), device)?;
 
-    let model =
-        DiffusionModel::new(device, latent_dimen, in_channels, num_time).load_record(record);
+    let model = DiffusionModel::new(device, latent_dimen, in_channels, num_time, time_embed_dim)
+        .load_record(record);
 
     Ok(model)
 }
@@ -1349,7 +1351,7 @@ fn main() {
         (0.001, 0.1),
         (0.01, 0.1),
         (16.0, 64.0),
-        (12.0, 64.0),
+        (32.0, 256.0),
         (150.0, 1200.0),
         (30.0, 150.0),
         (50.0, 200.0),
@@ -1359,6 +1361,8 @@ fn main() {
     let best_hyperparameter = bayesian_opt
         .optimize(|params: &[f64]| {
             let hp = Hyperparameters::array(params);
+
+            let time_embed_dim = 256;
 
             let opt_run_id: u64 = rand::random();
             let opt_run_id_str = format!("{:x}", opt_run_id);
@@ -1380,8 +1384,13 @@ fn main() {
             let eval_diffusion_epochs = hp.num_epochs;
             let eval_diffusion_batches = hp.batch_size.min(32);
 
-            let mut temp_model =
-                DiffusionModel::<Backend>::new(&device, hp.latent_dimen, 3, hp.num_steps);
+            let mut temp_model = DiffusionModel::<Backend>::new(
+                &device,
+                hp.latent_dimen,
+                3,
+                hp.num_steps,
+                time_embed_dim,
+            );
 
             let optimizer = AdamConfig::new();
             let mut temp_optimizer = optimizer.init();
@@ -1619,11 +1628,13 @@ fn main() {
 
     println!("\n Selected the best Hyperparameters from the choices...");
     let in_channels = 3;
+    let time_embed_dim = 256;
     let mut model = DiffusionModel::<Backend>::new(
         &device,
         best_hyperparameter.latent_dimen,
         in_channels,
         best_hyperparameter.num_steps,
+        time_embed_dim,
     );
     let optimizer_config = AdamConfig::new().with_weight_decay(Some(WeightDecayConfig::new(1e-4)));
     let mut optimizer = optimizer_config.init();

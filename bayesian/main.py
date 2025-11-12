@@ -1,7 +1,10 @@
 from typing import List, Tuple
 
 import torch
+<<<<<<< HEAD
 from botorch.fit import fit_gpytorch_model
+=======
+>>>>>>> 35e1a81af236fd72e7d610c39df6d47ebcee00a5
 from botorch.acquisition import ExpectedImprovement
 from botorch.models import SingleTaskGP
 from botorch.optim import optimize_acqf

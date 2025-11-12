@@ -1,8 +1,9 @@
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::Module;
 use burn::nn::conv::{Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig};
-use burn::nn::pool::{Dropout, DropoutConfig, MaxPool2d, MaxPool2dConfig};
+use burn::nn::pool::{MaxPool2d, MaxPool2dConfig};
 use burn::nn::{BatchNorm, BatchNormConfig, Initializer, Linear, LinearConfig, PaddingConfig2d};
+use burn::nn::{Dropout, DropoutConfig};
 use burn::optim::decay::WeightDecayConfig;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::record::{CompactRecorder, Recorder};
@@ -13,7 +14,6 @@ use burn::tensor::Int;
 use burn::tensor::Tensor;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use std::path::PathBuf;
-use std::time;
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -851,6 +851,7 @@ pub fn load_model<B: Backend>(
     in_channels: usize,
     latent_dimen: usize,
     num_time: usize,
+    time_embed_dim: usize,
     device: &B::Device,
 ) -> Result<DiffusionModel<B>, Box<dyn std::error::Error>> {
     let recorder = CompactRecorder::new();

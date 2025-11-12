@@ -1,8 +1,8 @@
 from typing import List, Tuple
 
 import torch
-from botorch import fit_gpytorch_model
 from botorch.acquisition import ExpectedImprovement
+from botorch.fit import fit_gpytorch_model
 from botorch.models import SingleTaskGP
 from botorch.optim import optimize_acqf
 from gpytorch.mlls import ExactMarginalLogLikelihood

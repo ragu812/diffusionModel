@@ -15,8 +15,8 @@ use burn::tensor::Tensor;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use std::path::PathBuf;
 
-use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::{BoundObject, prelude::*};
+use pyo3::types::{PyList,PyTuple};
 
 #[derive(Module, Debug)]
 pub struct SimpleEncoder<B: Backend> {
@@ -1166,11 +1166,11 @@ impl Bayesian {
 
             let bo_module = py.import("main")?;
             let bo_class = bo_module.getattr("BayesianLDM")?;
-            let py_bounds = PyList::new(py, &bounds);
-            let py_optimizer = bo_class.call((py_bounds, n_iterations), None)?;
+            let argument = PyList::new(py, &bounds)?;
+            let py_optimizer = bo_class.call1((&argument,n_iterations))?;
 
             Ok(Self {
-                py_optimizer: py_optimizer.into(),
+                py_optimizer: py_optimizer.unbind(),
                 n_iterations,
             })
         })
@@ -1178,7 +1178,7 @@ impl Bayesian {
 
     fn suggest(&self) -> PyResult<Vec<f64>> {
         Python::with_gil(|py| {
-            let optimizer = self.py_optimizer.as_ref(py);
+            let optimizer = self.py_optimizer.bind(py);
             let result = optimizer.call_method0("suggest")?;
             result.extract()
         })
@@ -1186,19 +1186,15 @@ impl Bayesian {
 
     fn observe(&self, params: Vec<f64>, score: f64) -> PyResult<()> {
         Python::with_gil(|py| {
-            let optimizer = self.py_optimizer.as_ref(py);
-            let py_params = PyList::empty(py);
-            for param in &params {
-                py_params.append((*param).into_py(py))?;
-            }
-            optimizer.call_method("observe", (py_params, score), None)?;
+            let optimizer = self.py_optimizer.bind(py);
+            optimizer.call_method1("observe", (params, score))?;
             Ok(())
         })
     }
 
     fn get_best(&self) -> PyResult<(Vec<f64>, f64)> {
         Python::with_gil(|py| {
-            let optimizer = self.py_optimizer.as_ref(py);
+            let optimizer = self.py_optimizer.bind(py);
             let result = optimizer.call_method0("get_best")?;
 
             let best_params: Vec<f64> = result.get_item(0)?.extract()?;
@@ -1331,7 +1327,7 @@ fn main() {
         .contrast(0.2);
 
     // Load dataset with augmentation
-    let dataset = Image::directory(r"/home/raghunesh/Downloads/my_burn/Pictures", 64, 64)
+    let dataset = Image::directory(r"/media/fiveangstrom/bea7bde0-8a48-4c9b-b22e-33c74677441c/diffusionModel/Pictures", 64, 64)
         .unwrap()
         .with_augmentation(augmentation);
 
@@ -1340,7 +1336,6 @@ fn main() {
         dataset.size
     );
 
-     Detect and set Python from bayesian/.venv if it exists
      let current_dir = std::env::current_dir().unwrap();
      let venv_python = current_dir.join("bayesian").join(".venv").join("bin").join("python");
 

@@ -37,8 +37,12 @@ class BayesianLDM:
                 + self.bounds[0]
             )
             print(f"\n The suggested points from BO {params.tolist()}")
+            print("check s1")
+            
             return params.tolist()
 
+
+        print("check 1")
         train_x = torch.tensor(self.x_observed, dtype=torch.float64).to(device)
         train_y = torch.tensor(
             self.y_observed, dtype=torch.float64
@@ -51,6 +55,9 @@ class BayesianLDM:
         model.likelihood.train()
         optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
 
+        print("check 2")
+
+
         for _ in range(TRAINING_ITERATIONS):
             optimizer.zero_grad()
             output = model(train_x)
@@ -60,6 +67,8 @@ class BayesianLDM:
 
         model.eval()
         model.likelihood.eval()
+        print("check 3")
+
 
         ei = ExpectedImprovement(model, best_f=train_y.max())
         candidate, _ = optimize_acqf(

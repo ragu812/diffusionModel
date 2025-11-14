@@ -1316,7 +1316,7 @@ fn main() {
 
     println!("Initializing GPU...");
     type Backend = Autodiff<Wgpu>;
-    let device = WgpuDevice::default();
+    let device = WgpuDevice::from(WgpuDevice::DiscreteGpu(0));
     println!("Using device: {:?}", device);
 
     let augmentation = Augmentation::new()
@@ -1347,7 +1347,7 @@ fn main() {
         (0.001, 0.1),
         (0.01, 0.1),
         (8.0, 32.0),
-        (16.0, 64.0),
+        (8.0, 64.0),
         (150.0, 1200.0),
         (30.0, 150.0),
         (50.0, 200.0),
@@ -1371,6 +1371,17 @@ fn main() {
                     hp.batch_size, dataset.size
                 );
                 return 100.0;
+            } else {
+                println!(
+                    "\n Evaluating Hyperparameters: lr={:.0e}, kl_weight={:.3}, batch_size={}, latent_dimen={}, num_steps={}, vae_epochs={}, diffusion_epochs={}",
+                    hp.learning_rate,
+                    hp.kl_loss_weight,
+                    hp.batch_size,
+                    hp.latent_dimen,
+                    hp.num_steps,
+                    hp.vae_epochs,
+                    hp.num_epochs
+                );
             }
 
             // Simple NaN detection flag
@@ -1423,17 +1434,14 @@ fn main() {
 
                         let loss_val = tensor_loss.clone().into_scalar().elem::<f32>();
 
-                        // Simple NaN check - break immediately
                         if loss_val.is_nan() || loss_val.is_infinite() {
                             println!(" NaN detected in VAE batch. Breaking iteration.");
                             break;
                         }
 
-                        // Gradient clipping before step
                         let grads = tensor_loss.backward();
                         let grad_params = GradientsParams::from_grads(grads, &temp_model);
 
-                        // Use smaller learning rate if loss is getting large
                         let adaptive_lr = if loss_val > 10.0 {
                             hp.learning_rate * 0.1
                         } else {
@@ -1454,7 +1462,6 @@ fn main() {
                     }
                 }
 
-                // Break out of epoch loop if NaN detected
                 if nan_detected {
                     break;
                 }

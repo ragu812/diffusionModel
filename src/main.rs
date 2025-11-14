@@ -15,8 +15,8 @@ use burn::tensor::Tensor;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use std::path::PathBuf;
 
-use pyo3::{BoundObject, prelude::*};
-use pyo3::types::{PyList,PyTuple};
+use pyo3:: prelude::*;
+use pyo3::types::PyList;
 
 #[derive(Module, Debug)]
 pub struct SimpleEncoder<B: Backend> {
@@ -644,7 +644,7 @@ impl<B: Backend> DiffusionModel<B> {
         let (z_noisy, noise) = self.add_noise(z, t.clone(), device);
 
         // Check for NaN in noisy latent
-        let z_sample = z_noisy.clone().into_scalar().elem::<f32>();
+        let z_sample = z_noisy.clone().mean().into_scalar().elem::<f32>();
         if z_sample.is_nan() || z_sample.is_infinite() {
             let tensor: Tensor<B, 1> = Tensor::from_floats([100.0], device);
             return tensor.reshape([1]);
@@ -655,7 +655,7 @@ impl<B: Backend> DiffusionModel<B> {
         let noise_pred = self.noise_predict(z_noisy, t_emb);
 
         // Check for NaN in noise prediction
-        let pred_sample = noise_pred.clone().into_scalar().elem::<f32>();
+        let pred_sample = noise_pred.clone().mean().into_scalar().elem::<f32>();
         if pred_sample.is_nan() || pred_sample.is_infinite() {
             let tensor: Tensor<B, 1> = Tensor::from_floats([100.0], device);
             return tensor.reshape([1]);
@@ -686,7 +686,7 @@ impl<B: Backend> DiffusionModel<B> {
         );
 
         // Simple NaN check for initial tensor
-        let z_check = z.clone().into_scalar().elem::<f32>();
+        let z_check = z.clone().mean().into_scalar().elem::<f32>();
         if z_check.is_nan() || z_check.is_infinite() {
             println!("NaN detected in initial noise tensor. Using zeros.");
             z = Tensor::zeros([batch_size, self.latent_dimen, 4, 4], device);
@@ -703,7 +703,7 @@ impl<B: Backend> DiffusionModel<B> {
             let noise_pred = self.noise_predict(z.clone(), i_emb);
 
             // Simple NaN check for noise prediction
-            let noise_check = noise_pred.clone().into_scalar().elem::<f32>();
+            let noise_check = noise_pred.clone().mean().into_scalar().elem::<f32>();
             if noise_check.is_nan() || noise_check.is_infinite() {
                 println!("NaN detected in noise prediction. Breaking iteration.");
                 break;
@@ -722,7 +722,7 @@ impl<B: Backend> DiffusionModel<B> {
             let pred_x0 = (z.clone() - noise_pred.clone() * alpha_sqrt_1_exp) / alpha_sqrt_exp;
 
             // Simple NaN check for predicted x0
-            let pred_x0_check = pred_x0.clone().into_scalar().elem::<f32>();
+            let pred_x0_check = pred_x0.clone().mean().into_scalar().elem::<f32>();
             if pred_x0_check.is_nan() || pred_x0_check.is_infinite() {
                 println!("NaN detected in predicted x0. Breaking iteration.");
                 break;
@@ -756,7 +756,7 @@ impl<B: Backend> DiffusionModel<B> {
                 z = mean + sigma_t_exp * noise;
 
                 // Simple NaN check for z after update
-                let z_check = z.clone().into_scalar().elem::<f32>();
+                let z_check = z.clone().mean().into_scalar().elem::<f32>();
                 if z_check.is_nan() || z_check.is_infinite() {
                     println!("NaN detected in z update. Breaking iteration.");
                     break;
@@ -764,7 +764,7 @@ impl<B: Backend> DiffusionModel<B> {
             } else {
                 z = pred_x0;
 
-                let z_final_check = z.clone().into_scalar().elem::<f32>();
+                let z_final_check = z.clone().mean().into_scalar().elem::<f32>();
                 if z_final_check.is_nan() || z_final_check.is_infinite() {
                     println!("NaN detected in final z. Breaking iteration.");
                     break;
@@ -777,7 +777,7 @@ impl<B: Backend> DiffusionModel<B> {
         }
 
         // Final NaN check before decoding
-        let final_z_check = z.clone().into_scalar().elem::<f32>();
+        let final_z_check = z.clone().mean().into_scalar().elem::<f32>();
         if final_z_check.is_nan() || final_z_check.is_infinite() {
             println!("NaN detected before decoding. Using fallback tensor.");
             z = Tensor::zeros([batch_size, self.latent_dimen, 4, 4], device);
@@ -785,7 +785,7 @@ impl<B: Backend> DiffusionModel<B> {
 
         let decoded = self.vae.decode(z);
 
-        let decoded_check = decoded.clone().into_scalar().elem::<f32>();
+        let decoded_check = decoded.clone().mean().into_scalar().elem::<f32>();
         if decoded_check.is_nan() || decoded_check.is_infinite() {
             println!("NaN detected in decoded output. Returning zeros.");
             return Tensor::zeros([batch_size, 3, 64, 64], device);
@@ -804,8 +804,8 @@ impl<B: Backend> DiffusionModel<B> {
         let variance_crt = variance_safe.clamp(-10.0, 1.0);
 
         // Check for NaN/inf in mean and variance before computation
-        let mean_data = mean.clone().into_scalar().elem::<f32>();
-        let var_sample = variance_crt.clone().into_scalar().elem::<f32>();
+        let mean_data = mean.clone().mean().into_scalar().elem::<f32>();
+        let var_sample = variance_crt.clone().mean().into_scalar().elem::<f32>();
 
         if mean_data.is_nan()
             || mean_data.is_infinite()
@@ -1278,7 +1278,7 @@ pub fn save_as_image<B: Backend>(
     let [_batch, _channels, height, width] = tensor.dims();
 
     // Check tensor for NaN/Inf before processing
-    let tensor_check = tensor.clone().into_scalar().elem::<f32>();
+    let tensor_check = tensor.clone().mean().into_scalar().elem::<f32>();
     let values: Vec<f32> = if tensor_check.is_nan() || tensor_check.is_infinite() {
         println!(
             "Warning: NaN/Inf detected in tensor for image {}. Creating black image.",
@@ -1327,7 +1327,7 @@ fn main() {
         .contrast(0.2);
 
     // Load dataset with augmentation
-    let dataset = Image::directory(r"/media/fiveangstrom/bea7bde0-8a48-4c9b-b22e-33c74677441c/diffusionModel/Pictures", 64, 64)
+    let dataset = Image::directory(r"/home/raghunesh/Downloads/diffusionModel/Pictures", 64, 64)
         .unwrap()
         .with_augmentation(augmentation);
 
@@ -1346,12 +1346,14 @@ fn main() {
     let bounds = vec![
         (0.001, 0.1),
         (0.01, 0.1),
+        (8.0, 32.0),
         (16.0, 64.0),
-        (32.0, 256.0),
         (150.0, 1200.0),
         (30.0, 150.0),
         (50.0, 200.0),
     ];
+
+    println!("The Range for BO is {:?}", bounds);
     let bayesian_opt = Bayesian::new(bounds, 10).unwrap();
 
     let best_hyperparameter = bayesian_opt
@@ -1613,7 +1615,7 @@ fn main() {
             let combined_loss = vae_loss * 0.3 + diffusion_loss * 0.7;
 
             println!(
-                "✓ VAE Loss: {:.6}, Diffusion Loss: {:.6}, Combined: {:.6}",
+                " VAE Loss: {:.6}, Diffusion Loss: {:.6}, Combined: {:.6}",
                 vae_loss, diffusion_loss, combined_loss
             );
 

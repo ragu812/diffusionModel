@@ -1,14 +1,15 @@
 from typing import List, Tuple
 
 import torch
-<<<<<<< HEAD
-from botorch.fit import fit_gpytorch_model
-=======
->>>>>>> 35e1a81af236fd72e7d610c39df6d47ebcee00a5
+from torch.optim import Adam
 from botorch.acquisition import ExpectedImprovement
 from botorch.models import SingleTaskGP
 from botorch.optim import optimize_acqf
 from gpytorch.mlls import ExactMarginalLogLikelihood
+
+TRAINING_ITERATIONS = 100 
+LEARNING_RATE = 0.1
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -38,14 +39,27 @@ class BayesianLDM:
             print(f"\n The suggested points from BO {params.tolist()}")
             return params.tolist()
 
-        train_x = torch.tensor(self.x_observed, dtype=torch.float64, device=device)
+        train_x = torch.tensor(self.x_observed, dtype=torch.float64).to(device)
         train_y = torch.tensor(
-            self.y_observed, dtype=torch.float64, device=device
-        ).unsqueeze(-1)
+            self.y_observed, dtype=torch.float64
+        ).unsqueeze(-1).to(device)
 
         model = SingleTaskGP(train_x, train_y)
         mll = ExactMarginalLogLikelihood(model.likelihood, model)
-        fit_gpytorch_model(mll)
+        
+        model.train()
+        model.likelihood.train()
+        optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
+
+        for _ in range(TRAINING_ITERATIONS):
+            optimizer.zero_grad()
+            output = model(train_x)
+            loss = -mll(output, train_y)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        model.likelihood.eval()
 
         ei = ExpectedImprovement(model, best_f=train_y.max())
         candidate, _ = optimize_acqf(
